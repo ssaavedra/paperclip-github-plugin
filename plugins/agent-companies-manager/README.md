@@ -9,7 +9,8 @@ Development for this plugin is driven by [`SPEC.md`](./SPEC.md). Implementation,
 ## Available scripts
 
 - `pnpm test` — runs the package-level Node tests.
-- `pnpm test:e2e` — installs the required Playwright Chromium binary if needed, boots an isolated Paperclip instance from a generated local config, seeds a dummy company through the Paperclip API, installs this local plugin package, and verifies with Playwright that the Paperclip plugins settings page loads in headless mode.
+- `pnpm test:e2e` — installs the required Playwright Chromium binary if needed, boots an isolated Paperclip instance on free random ports from a generated local config, seeds a dummy company through the Paperclip API, installs this local plugin package, and verifies with Playwright that the Paperclip plugins settings page loads in headless mode.
+- `pnpm verify:manual` — prepares the same disposable Paperclip instance on free random ports, opens the real plugin settings URL in your default browser automatically, and keeps the server running for manual inspection until you stop it with `Ctrl+C`.
 
 ## Installable plugin package contract
 
@@ -37,6 +38,16 @@ What it does:
 
 The harness writes the most recent detected plugins settings path to `tests/e2e/results/last-run.json` to make route discovery visible across sessions.
 
+## Manual verification
+
+Run this from the plugin directory:
+
+```bash
+pnpm verify:manual
+```
+
+The command opens the actual disposable instance URL in your default browser, prints the same URL to the terminal, keeps the Paperclip instance running, and leaves cleanup to `Ctrl+C`. This is useful when you want to inspect the seeded instance yourself after the plugin is installed.
+
 ## Current package layout
 
 - `src/manifest.ts` - source manifest placeholder
@@ -47,6 +58,7 @@ The harness writes the most recent detected plugins settings path to `tests/e2e/
 - `dist/ui/index.js` - installable UI artifact
 - `tests/plugin.spec.ts` - basic structure tests
 - `scripts/e2e/run-paperclip-smoke.mjs` - reusable headless Paperclip + Playwright smoke test harness
+- `scripts/e2e/manual-paperclip-verify.mjs` - disposable manual inspection harness that keeps Paperclip alive until interrupted
 
 ## Notes
 

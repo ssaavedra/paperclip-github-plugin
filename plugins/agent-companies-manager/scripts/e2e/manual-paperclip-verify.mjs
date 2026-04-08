@@ -9,13 +9,12 @@ import net from 'node:net';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, '..', '..');
-const stateRoot = await mkdtemp(join(tmpdir(), 'agent-companies-manager-e2e-'));
+const stateRoot = await mkdtemp(join(tmpdir(), 'agent-companies-manager-manual-'));
 const paperclipHome = join(stateRoot, 'paperclip-home');
 const dataDir = join(stateRoot, 'paperclip-data');
-const instanceId = 'agent-companies-manager-e2e';
+const instanceId = 'agent-companies-manager-manual';
 const requestedPort = process.env.PAPERCLIP_E2E_PORT ? Number(process.env.PAPERCLIP_E2E_PORT) : 3100;
 const requestedDbPort = process.env.PAPERCLIP_E2E_DB_PORT ? Number(process.env.PAPERCLIP_E2E_DB_PORT) : 54329;
-const defaultTimeoutMs = 30000;
 const env = {
   ...process.env,
   CI: 'true',
@@ -30,12 +29,17 @@ const env = {
 
 let serverProcess;
 let cleanedUp = false;
+let shutdownRequested = false;
+let shutdownResolver;
+const shutdownPromise = new Promise((resolve) => {
+  shutdownResolver = resolve;
+});
 let baseUrl;
 let serverPort;
 let embeddedDbPort;
 
 function log(message) {
-  console.log(`[agent-companies-manager:e2e] ${message}`);
+  console.log(`[agent-companies-manager:manual] ${message}`);
 }
 
 function getPaperclipCommandArgs(args) {
@@ -242,17 +246,30 @@ async function ensureCompanySeeded() {
     method: 'POST',
     body: JSON.stringify({
       name: 'Dummy Company',
-      description: 'Seed company for agent-companies-manager e2e verification.'
+      description: 'Seed company for manual agent-companies-manager verification.'
     })
   });
 
-  const postCreateCompanies = await fetchJson(companiesUrl);
-  if (!Array.isArray(postCreateCompanies) || postCreateCompanies.length === 0) {
-    throw new Error('Expected at least one company after seeding, but Paperclip still reports none.');
-  }
+  log(`Seeded company ${createdCompany?.name ?? 'Dummy Company'}.`);
+  return createdCompany;
+}
 
-  log(`Seeded company ${createdCompany?.name ?? postCreateCompanies[0]?.name ?? 'unknown'}.`);
-  return postCreateCompanies[0];
+async function ensurePluginInstalled(configPath) {
+  try {
+    await runCommand(
+      'npx',
+      getPaperclipCommandArgs(['plugin', 'install', '--local', pluginRoot, '--data-dir', dataDir, '--config', configPath])
+    );
+    log('Installed local agent-companies-manager plugin.');
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes('Plugin already installed: agent-companies-manager')) {
+      log('Plugin already installed in the disposable instance; continuing.');
+      return;
+    }
+
+    throw error;
+  }
 }
 
 async function waitForServerExit(timeoutMs) {
@@ -300,50 +317,22 @@ async function cleanup() {
   await rm(stateRoot, { recursive: true, force: true });
 }
 
-async function gotoWithTimeout(page, url) {
-  return page.goto(url, {
-    waitUntil: 'domcontentloaded',
-    timeout: defaultTimeoutMs
-  });
-}
-
-async function detectPluginSettingsPath(page) {
-  const candidates = ['/settings/plugins', '/plugins/settings', '/settings'];
-
-  for (const path of candidates) {
-    const response = await gotoWithTimeout(page, new URL(path, baseUrl).toString());
-    const bodyText = (await page.textContent('body', { timeout: defaultTimeoutMs }).catch(() => '')) ?? '';
-    if (response && response.ok() && /plugin/i.test(bodyText)) {
-      return path;
-    }
-  }
-
-  await gotoWithTimeout(page, baseUrl);
-
-  const links = await page.locator('a').evaluateAll((anchors) =>
-    anchors.map((anchor) => ({
-      href: anchor.getAttribute('href') ?? '',
-      text: anchor.textContent ?? ''
-    }))
-  );
-
-  const pluginLink = links.find((link) => /plugin/i.test(link.text) || /plugin/i.test(link.href));
-  if (!pluginLink?.href) {
-    throw new Error('Could not find a plugins settings page link in the Paperclip UI.');
-  }
-
-  const targetUrl = new URL(pluginLink.href, baseUrl).toString();
-  const url = new URL(targetUrl);
-  await gotoWithTimeout(page, targetUrl);
-  return `${url.pathname}${url.search}`;
-}
-
 async function main() {
   process.on('SIGINT', () => {
-    void cleanup().finally(() => process.exit(130));
+    if (shutdownRequested) {
+      return;
+    }
+
+    shutdownRequested = true;
+    void cleanup().finally(() => shutdownResolver());
   });
   process.on('SIGTERM', () => {
-    void cleanup().finally(() => process.exit(143));
+    if (shutdownRequested) {
+      return;
+    }
+
+    shutdownRequested = true;
+    void cleanup().finally(() => shutdownResolver());
   });
 
   log(`Working directory ${stateRoot}`);
@@ -375,60 +364,22 @@ async function main() {
   await waitForReady(baseUrl, 180000);
   log(`Paperclip server is ready at ${baseUrl}.`);
 
-  await ensureCompanySeeded();
+  const company = await ensureCompanySeeded();
+  await ensurePluginInstalled(configPath);
 
-  const companyList = await runCommand(
-    'npx',
-    getPaperclipCommandArgs(['company', 'list', '--data-dir', dataDir, '--config', configPath, '--json'])
-  );
-  const listedCompanies = JSON.parse(companyList.stdout);
-  if (!Array.isArray(listedCompanies) || listedCompanies.length === 0) {
-    throw new Error('Paperclip company list returned no companies after seeding.');
-  }
+  const manualUrl = `${baseUrl}/settings/plugins`;
+  await runCommand('open', [manualUrl], { stdio: 'ignore' });
 
-  await runCommand(
-    'npx',
-    getPaperclipCommandArgs(['plugin', 'install', '--local', pluginRoot, '--data-dir', dataDir, '--config', configPath])
-  );
-  log('Installed local agent-companies-manager plugin.');
+  console.log('');
+  console.log('Manual verification instance is ready.');
+  console.log(`Open: ${manualUrl}`);
+  console.log(`Company: ${company?.name ?? 'Dummy Company'}`);
+  console.log(`State dir: ${stateRoot}`);
+  console.log('The URL has been opened in your default browser.');
+  console.log('Press Ctrl+C when you are done inspecting the instance.');
+  console.log('');
 
-  const { chromium } = await import('playwright');
-  const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage();
-  page.setDefaultTimeout(defaultTimeoutMs);
-
-  try {
-    await gotoWithTimeout(page, new URL('/', baseUrl).toString());
-
-    if (page.url().includes('/onboarding')) {
-      throw new Error(`Paperclip still redirected to onboarding after seeding: ${page.url()}`);
-    }
-
-    const pluginSettingsPath = await detectPluginSettingsPath(page);
-    log(`Resolved plugin settings path: ${pluginSettingsPath}`);
-
-    const bodyText = await page.textContent('body', { timeout: defaultTimeoutMs });
-    if (!bodyText || !/plugin/i.test(bodyText)) {
-      throw new Error('Paperclip plugin settings page did not render plugin-related content.');
-    }
-
-    await writeFile(
-      join(pluginRoot, 'tests/e2e/results/last-run.json'),
-      JSON.stringify(
-        {
-          baseUrl,
-          pluginSettingsPath,
-          companyCount: listedCompanies.length
-        },
-        null,
-        2
-      )
-    );
-  } finally {
-    await browser.close();
-  }
-
-  await cleanup();
+  await shutdownPromise;
 }
 
 try {
