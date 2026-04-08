@@ -1,0 +1,5 @@
+{
+  "baseUrl": "http://127.0.0.1:56451",
+  "settingsUrl": "http://127.0.0.1:56451/instance/settings/plugins/0121521d-e163-424d-9b59-84f5c675b08a",
+  "bodyText": "\n    Skip to Main ContentD\n    To pick up a draggable item, press the space bar.\n    While dragging, use the arrow keys to move the item.\n    Press space again to drop the item in its new position, or press escape to cancel.\n  Instance SettingsGeneralHeartbeatsExperimentalPluginsGitHub SyncDocumentationvDummy CompanySettingsPluginsGitHub SyncGitHub Syncreadyv0.1.0ConfigurationStatusAboutDescriptionScaffold plugin for future GitHub synchronization workflows.AuthorÁlvaro Sánchez-MariscalCategoriesworkspaceSettingsGitHub SyncThis scaffold verifies that a settings-page plugin can mount inside Paperclip, talk to a worker, and run end-to-end automation in a disposable Paperclip instance.Scaffold statusGitHub Sync scaffold action executed successfully.Last updated: 4/8/2026, 5:39:36 PMRun scaffold actionCommand PaletteSearch for a command to run...\n  \n\n"
+}

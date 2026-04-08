@@ -9,12 +9,13 @@ import net from 'node:net';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, '..', '..');
-const stateRoot = await mkdtemp(join(tmpdir(), 'agent-companies-manager-manual-'));
+const stateRoot = await mkdtemp(join(tmpdir(), 'github-sync-e2e-'));
 const paperclipHome = join(stateRoot, 'paperclip-home');
 const dataDir = join(stateRoot, 'paperclip-data');
-const instanceId = 'agent-companies-manager-manual';
+const instanceId = 'github-sync-e2e';
 const requestedPort = process.env.PAPERCLIP_E2E_PORT ? Number(process.env.PAPERCLIP_E2E_PORT) : 3100;
 const requestedDbPort = process.env.PAPERCLIP_E2E_DB_PORT ? Number(process.env.PAPERCLIP_E2E_DB_PORT) : 54329;
+const defaultTimeoutMs = 30000;
 const env = {
   ...process.env,
   CI: 'true',
@@ -29,17 +30,12 @@ const env = {
 
 let serverProcess;
 let cleanedUp = false;
-let shutdownRequested = false;
-let shutdownResolver;
-const shutdownPromise = new Promise((resolve) => {
-  shutdownResolver = resolve;
-});
 let baseUrl;
 let serverPort;
 let embeddedDbPort;
 
 function log(message) {
-  console.log(`[agent-companies-manager:manual] ${message}`);
+  console.log(`[github-sync:e2e] ${message}`);
 }
 
 function getPaperclipCommandArgs(args) {
@@ -246,30 +242,17 @@ async function ensureCompanySeeded() {
     method: 'POST',
     body: JSON.stringify({
       name: 'Dummy Company',
-      description: 'Seed company for manual agent-companies-manager verification.'
+      description: 'Seed company for github-sync e2e verification.'
     })
   });
 
-  log(`Seeded company ${createdCompany?.name ?? 'Dummy Company'}.`);
-  return createdCompany;
-}
-
-async function ensurePluginInstalled(configPath) {
-  try {
-    await runCommand(
-      'npx',
-      getPaperclipCommandArgs(['plugin', 'install', '--local', pluginRoot, '--data-dir', dataDir, '--config', configPath])
-    );
-    log('Installed local agent-companies-manager plugin.');
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (message.includes('Plugin already installed: agent-companies-manager')) {
-      log('Plugin already installed in the disposable instance; continuing.');
-      return;
-    }
-
-    throw error;
+  const postCreateCompanies = await fetchJson(companiesUrl);
+  if (!Array.isArray(postCreateCompanies) || postCreateCompanies.length === 0) {
+    throw new Error('Expected at least one company after seeding, but Paperclip still reports none.');
   }
+
+  log(`Seeded company ${createdCompany?.name ?? postCreateCompanies[0]?.name ?? 'unknown'}.`);
+  return postCreateCompanies[0];
 }
 
 async function waitForServerExit(timeoutMs) {
@@ -317,22 +300,19 @@ async function cleanup() {
   await rm(stateRoot, { recursive: true, force: true });
 }
 
+async function gotoWithTimeout(page, url) {
+  return page.goto(url, {
+    waitUntil: 'domcontentloaded',
+    timeout: defaultTimeoutMs
+  });
+}
+
 async function main() {
   process.on('SIGINT', () => {
-    if (shutdownRequested) {
-      return;
-    }
-
-    shutdownRequested = true;
-    void cleanup().finally(() => shutdownResolver());
+    void cleanup().finally(() => process.exit(130));
   });
   process.on('SIGTERM', () => {
-    if (shutdownRequested) {
-      return;
-    }
-
-    shutdownRequested = true;
-    void cleanup().finally(() => shutdownResolver());
+    void cleanup().finally(() => process.exit(143));
   });
 
   log(`Working directory ${stateRoot}`);
@@ -340,6 +320,7 @@ async function main() {
   serverPort = await findAvailablePort(requestedPort);
   embeddedDbPort = await findAvailablePort(requestedDbPort);
   const configPath = join(paperclipHome, 'instances', instanceId, 'config.json');
+  env.PAPERCLIP_CONFIG_PATH = configPath;
   await ensureConfigFile(configPath);
   baseUrl = await readConfiguredBaseUrl(configPath);
 
@@ -364,22 +345,58 @@ async function main() {
   await waitForReady(baseUrl, 180000);
   log(`Paperclip server is ready at ${baseUrl}.`);
 
-  const company = await ensureCompanySeeded();
-  await ensurePluginInstalled(configPath);
+  await ensureCompanySeeded();
 
-  const manualUrl = `${baseUrl}/settings/plugins`;
-  await runCommand('open', [manualUrl], { stdio: 'ignore' });
+  await runCommand(
+    'npx',
+    getPaperclipCommandArgs(['plugin', 'install', '--local', pluginRoot, '--data-dir', dataDir, '--config', configPath])
+  );
+  log('Installed local github-sync plugin.');
 
-  console.log('');
-  console.log('Manual verification instance is ready.');
-  console.log(`Open: ${manualUrl}`);
-  console.log(`Company: ${company?.name ?? 'Dummy Company'}`);
-  console.log(`State dir: ${stateRoot}`);
-  console.log('The URL has been opened in your default browser.');
-  console.log('Press Ctrl+C when you are done inspecting the instance.');
-  console.log('');
+  const { chromium } = await import('playwright');
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+  page.setDefaultTimeout(defaultTimeoutMs);
 
-  await shutdownPromise;
+  try {
+    const settingsIndexUrl = new URL('/instance/settings/plugins', baseUrl).toString();
+    await gotoWithTimeout(page, settingsIndexUrl);
+
+    const pluginLink = page.getByRole('link', { name: 'GitHub Sync' }).first();
+    await pluginLink.waitFor({ timeout: 120000 });
+    const href = await pluginLink.getAttribute('href');
+    if (!href) {
+      throw new Error('Could not resolve plugin settings detail href.');
+    }
+
+    const settingsUrl = new URL(href, baseUrl).toString();
+    await gotoWithTimeout(page, settingsUrl);
+    log(`Opened plugin settings detail page: ${settingsUrl}`);
+
+    await page.getByRole('heading', { name: 'GitHub Sync' }).waitFor({ timeout: 120000 });
+    await page.getByRole('heading', { name: 'GitHub Sync' }).waitFor({ timeout: 120000 });
+    await page.getByRole('button', { name: 'Run scaffold action' }).click();
+    await page.getByText('GitHub Sync scaffold action executed successfully.', { exact: false }).waitFor({ timeout: 120000 });
+
+    await page.screenshot({ path: join(pluginRoot, 'tests/e2e/results/last-run.png'), fullPage: true });
+    const bodyText = await page.locator('body').textContent();
+    await writeFile(
+      join(pluginRoot, 'tests/e2e/results/last-run.json'),
+      JSON.stringify(
+        {
+          baseUrl,
+          settingsUrl,
+          bodyText
+        },
+        null,
+        2
+      )
+    );
+  } finally {
+    await browser.close();
+  }
+
+  await cleanup();
 }
 
 try {
