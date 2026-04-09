@@ -8,6 +8,7 @@ The plugin MUST provide a settings page inside Paperclip where an operator can c
 
 - a GitHub token stored as a Paperclip secret reference
 - one or more GitHub repository mappings
+- the frequency for automatic scheduled sync runs
 - a Paperclip project name per mapping where synchronized issues should be created
 
 The settings page MUST allow saving mappings and triggering a manual sync.
@@ -24,7 +25,7 @@ The settings page MUST allow saving mappings and triggering a manual sync.
 The plugin MUST persist repository mappings and sync state in plugin state.
 - The worker MUST expose at least one data endpoint for reading the current settings and sync status.
 - The worker MUST expose action endpoints for saving mappings and triggering a manual sync.
-- The plugin MUST declare a scheduled job that reads the saved settings and runs every 15 minutes.
+- The plugin MUST declare a scheduled job that ticks every minute and only performs a scheduled sync when the saved frequency is due.
 - The sync flow MUST fetch open GitHub issues from every configured repository.
 - The sync flow MUST create one Paperclip issue per imported GitHub issue when the target mapping has a resolved Paperclip project identifier.
 - Repeated sync runs MUST skip issues that were already imported for the same mapping.

@@ -16,6 +16,8 @@ const IMPORT_REGISTRY_SCOPE = {
   stateKey: 'github-sync-import-registry'
 };
 
+const DEFAULT_SCHEDULE_FREQUENCY_MINUTES = 15;
+
 interface RepositoryMapping {
   id: string;
   repositoryUrl: string;
@@ -44,6 +46,7 @@ interface ImportedIssueRecord {
 interface GitHubSyncSettings {
   mappings: RepositoryMapping[];
   syncState: SyncRunState;
+  scheduleFrequencyMinutes: number;
   updatedAt?: string;
 }
 
@@ -74,7 +77,8 @@ const DEFAULT_SETTINGS: GitHubSyncSettings = {
   mappings: [],
   syncState: {
     status: 'idle'
-  }
+  },
+  scheduleFrequencyMinutes: DEFAULT_SCHEDULE_FREQUENCY_MINUTES
 };
 
 function createMappingId(index: number): string {
@@ -136,6 +140,21 @@ function normalizeMappings(value: unknown): RepositoryMapping[] {
   });
 }
 
+function normalizeScheduleFrequencyMinutes(value: unknown): number {
+  const numericValue =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string'
+        ? Number(value.trim())
+        : NaN;
+
+  if (!Number.isFinite(numericValue) || numericValue < 1) {
+    return DEFAULT_SCHEDULE_FREQUENCY_MINUTES;
+  }
+
+  return Math.floor(numericValue);
+}
+
 function normalizeSettings(value: unknown): GitHubSyncSettings {
   if (!value || typeof value !== 'object') {
     return DEFAULT_SETTINGS;
@@ -146,6 +165,7 @@ function normalizeSettings(value: unknown): GitHubSyncSettings {
   return {
     mappings: normalizeMappings(record.mappings),
     syncState: normalizeSyncState(record.syncState),
+    scheduleFrequencyMinutes: normalizeScheduleFrequencyMinutes(record.scheduleFrequencyMinutes),
     updatedAt: typeof record.updatedAt === 'string' ? record.updatedAt : undefined
   };
 }
@@ -305,6 +325,22 @@ async function validateGithubToken(token: string): Promise<TokenValidationResult
   }
 }
 
+function shouldRunScheduledSync(settings: GitHubSyncSettings, scheduledAt?: string): boolean {
+  if (!settings.syncState.checkedAt) {
+    return true;
+  }
+
+  const lastCheckedAt = Date.parse(settings.syncState.checkedAt);
+  if (Number.isNaN(lastCheckedAt)) {
+    return true;
+  }
+
+  const scheduledTime = scheduledAt ? Date.parse(scheduledAt) : NaN;
+  const now = Number.isNaN(scheduledTime) ? Date.now() : scheduledTime;
+
+  return now - lastCheckedAt >= settings.scheduleFrequencyMinutes * 60_000;
+}
+
 async function performSync(ctx: Parameters<Parameters<typeof definePlugin>[0]['setup']>[0], trigger: 'manual' | 'schedule' | 'retry') {
   const settings = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
   const importRegistry = normalizeImportRegistry(await ctx.state.get(IMPORT_REGISTRY_SCOPE));
@@ -440,7 +476,13 @@ const plugin = definePlugin({
     });
 
     ctx.actions.register('settings.saveRegistration', async (input) => {
-      const current = normalizeSettings(input);
+      const previous = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
+      const record = input && typeof input === 'object' ? input as Record<string, unknown> : {};
+      const current = normalizeSettings({
+        mappings: 'mappings' in record ? record.mappings : previous.mappings,
+        syncState: 'syncState' in record ? record.syncState : previous.syncState,
+        scheduleFrequencyMinutes: 'scheduleFrequencyMinutes' in record ? record.scheduleFrequencyMinutes : previous.scheduleFrequencyMinutes
+      });
       const next = {
         mappings: current.mappings.map((mapping, index) => ({
           id: mapping.id.trim() || createMappingId(index),
@@ -450,6 +492,7 @@ const plugin = definePlugin({
           companyId: mapping.companyId
         })),
         syncState: current.syncState,
+        scheduleFrequencyMinutes: current.scheduleFrequencyMinutes,
         updatedAt: new Date().toISOString()
       };
 
@@ -473,6 +516,11 @@ const plugin = definePlugin({
     });
 
     ctx.jobs.register('sync.github-issues', async (job) => {
+      const settings = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
+      if (job.trigger === 'schedule' && !shouldRunScheduledSync(settings, job.scheduledAt)) {
+        return;
+      }
+
       await performSync(ctx, job.trigger === 'retry' ? 'retry' : 'schedule');
     });
   }

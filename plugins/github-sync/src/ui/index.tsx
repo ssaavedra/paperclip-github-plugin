@@ -22,6 +22,7 @@ interface SyncRunState {
 interface GitHubSyncSettings {
   mappings: RepositoryMapping[];
   syncState: SyncRunState;
+  scheduleFrequencyMinutes: number;
   githubTokenConfigured?: boolean;
   updatedAt?: string;
 }
@@ -148,11 +149,14 @@ const DARK_PALETTE: ThemePalette = {
   shadow: '0 18px 40px rgba(0, 0, 0, 0.24)'
 };
 
+const DEFAULT_SCHEDULE_FREQUENCY_MINUTES = 15;
+
 const EMPTY_SETTINGS: GitHubSyncSettings = {
   mappings: [],
   syncState: {
     status: 'idle'
-  }
+  },
+  scheduleFrequencyMinutes: DEFAULT_SCHEDULE_FREQUENCY_MINUTES
 };
 
 const PAGE_STYLES = `
@@ -399,6 +403,10 @@ const PAGE_STYLES = `
   line-height: 1.5;
 }
 
+.ghsync__hint--error {
+  color: var(--ghsync-danger-text);
+}
+
 .ghsync__actions,
 .ghsync__section-footer,
 .ghsync__connected,
@@ -516,6 +524,7 @@ const PAGE_STYLES = `
 }
 
 .ghsync__mapping-card,
+.ghsync__schedule-card,
 .ghsync__stat {
   border: 1px solid var(--ghsync-border-soft);
   border-radius: 10px;
@@ -526,6 +535,14 @@ const PAGE_STYLES = `
   display: grid;
   gap: 12px;
   padding: 14px;
+}
+
+.ghsync__schedule-card {
+  display: grid;
+  gap: 12px;
+  align-items: start;
+  padding: 14px;
+  grid-template-columns: minmax(0, 1fr) minmax(180px, 0.8fr);
 }
 
 .ghsync__mapping-title strong {
@@ -553,6 +570,22 @@ const PAGE_STYLES = `
   display: grid;
   gap: 10px;
   grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.ghsync__schedule-meta {
+  display: grid;
+  gap: 4px;
+}
+
+.ghsync__schedule-meta strong {
+  font-size: 13px;
+  color: var(--ghsync-title);
+}
+
+.ghsync__schedule-meta span {
+  color: var(--ghsync-muted);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .ghsync__stat {
@@ -618,6 +651,7 @@ const PAGE_STYLES = `
 
 @media (max-width: 980px) {
   .ghsync__layout,
+  .ghsync__schedule-card,
   .ghsync__mapping-grid,
   .ghsync__stats {
     grid-template-columns: minmax(0, 1fr);
@@ -945,6 +979,54 @@ function getComparableMappings(mappings: RepositoryMapping[]): RepositoryMapping
     .filter((mapping) => mapping.repositoryUrl !== '' || mapping.paperclipProjectName !== '');
 }
 
+function normalizeScheduleFrequencyMinutes(value: unknown): number {
+  const numericValue =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string'
+        ? Number(value.trim())
+        : NaN;
+
+  if (!Number.isFinite(numericValue) || numericValue < 1) {
+    return DEFAULT_SCHEDULE_FREQUENCY_MINUTES;
+  }
+
+  return Math.floor(numericValue);
+}
+
+function parseScheduleFrequencyDraft(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const numericValue = Number(trimmed);
+  if (!Number.isFinite(numericValue) || numericValue < 1 || !Number.isInteger(numericValue)) {
+    return null;
+  }
+
+  return numericValue;
+}
+
+function getScheduleFrequencyError(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return 'Enter a whole number of minutes.';
+  }
+
+  const numericValue = Number(trimmed);
+  if (!Number.isFinite(numericValue) || numericValue < 1 || !Number.isInteger(numericValue)) {
+    return 'Enter a whole number of minutes greater than 0.';
+  }
+
+  return null;
+}
+
+function formatScheduleFrequency(minutes: number): string {
+  const normalizedMinutes = normalizeScheduleFrequencyMinutes(minutes);
+  return `every ${normalizedMinutes} minute${normalizedMinutes === 1 ? '' : 's'}`;
+}
+
 function parseRepositoryReference(repositoryInput: string): ParsedRepositoryReference | null {
   const trimmed = repositoryInput.trim();
   if (!trimmed) {
@@ -1230,8 +1312,11 @@ function getDashboardSummary(
   tokenValid: boolean,
   savedMappingCount: number,
   syncState: SyncRunState,
-  runningSync: boolean
+  runningSync: boolean,
+  scheduleFrequencyMinutes: number
 ): { label: string; tone: Tone; title: string; body: string } {
+  const cadence = formatScheduleFrequency(scheduleFrequencyMinutes);
+
   if (!tokenValid) {
     return {
       label: 'Setup required',
@@ -1273,7 +1358,7 @@ function getDashboardSummary(
       label: 'Ready',
       tone: syncState.status === 'success' ? 'success' : 'info',
       title: 'GitHub sync activity',
-      body: syncState.message ?? 'Run a sync now or let the schedule keep issues current.'
+      body: syncState.message ?? `Automatic sync runs ${cadence}.`
     };
   }
 
@@ -1281,7 +1366,7 @@ function getDashboardSummary(
     label: 'Ready',
     tone: 'info',
     title: 'Ready for first sync',
-    body: 'Your repository mapping is in place. Run the first sync when you are ready.'
+    body: `Your repository mapping is in place. Automatic sync runs ${cadence}.`
   };
 }
 
@@ -1334,8 +1419,9 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
   const runSyncNow = usePluginAction('sync.runNow');
   const [form, setForm] = useState<GitHubSyncSettings>(EMPTY_SETTINGS);
   const [submittingToken, setSubmittingToken] = useState(false);
-  const [submittingMappings, setSubmittingMappings] = useState(false);
+  const [submittingSetup, setSubmittingSetup] = useState(false);
   const [runningSync, setRunningSync] = useState(false);
+  const [scheduleFrequencyDraft, setScheduleFrequencyDraft] = useState(String(DEFAULT_SCHEDULE_FREQUENCY_MINUTES));
   const [tokenStatusOverride, setTokenStatusOverride] = useState<TokenStatus | null>(null);
   const [validatedLogin, setValidatedLogin] = useState<string | null>(null);
   const [tokenDraft, setTokenDraft] = useState('');
@@ -1348,12 +1434,15 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
       return;
     }
 
+    const nextScheduleFrequencyMinutes = normalizeScheduleFrequencyMinutes(settings.data.scheduleFrequencyMinutes);
     setForm({
       mappings: settings.data.mappings ?? [],
       syncState: settings.data.syncState ?? { status: 'idle' },
+      scheduleFrequencyMinutes: nextScheduleFrequencyMinutes,
       githubTokenConfigured: settings.data.githubTokenConfigured,
       updatedAt: settings.data.updatedAt
     });
+    setScheduleFrequencyDraft(String(nextScheduleFrequencyMinutes));
     setTokenDraft('');
 
     if (settings.data.githubTokenConfigured) {
@@ -1401,13 +1490,23 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
   const savedMappingCount = savedMappings.length;
   const syncUnlocked = tokenStatus === 'valid' && savedMappingCount > 0;
   const mappingsDirty = JSON.stringify(draftMappings) !== JSON.stringify(savedMappings);
+  const scheduleFrequencyError = getScheduleFrequencyError(scheduleFrequencyDraft);
+  const scheduleFrequencyMinutes = parseScheduleFrequencyDraft(scheduleFrequencyDraft) ?? form.scheduleFrequencyMinutes;
+  const savedScheduleFrequencyMinutes = normalizeScheduleFrequencyMinutes(settings.data?.scheduleFrequencyMinutes);
+  const scheduleDirty = scheduleFrequencyError === null && scheduleFrequencyMinutes !== savedScheduleFrequencyMinutes;
   const mappings = form.mappings.length > 0 ? form.mappings : [createEmptyMapping(0)];
   const syncStatus = getSyncStatus(form.syncState, runningSync, syncUnlocked);
   const canSaveToken = !submittingToken && !settings.loading && tokenDraft.trim().length > 0;
-  const canSaveMappings = repositoriesUnlocked && !submittingMappings && !settings.loading && mappingsDirty;
+  const canSaveSetup =
+    repositoriesUnlocked &&
+    !submittingSetup &&
+    !settings.loading &&
+    scheduleFrequencyError === null &&
+    (mappingsDirty || scheduleDirty);
   const showTokenForm = tokenStatus !== 'valid' || showTokenEditor;
   const lastUpdated = formatDate(form.updatedAt ?? settings.data?.updatedAt, 'Not saved yet');
   const lastSync = formatDate(form.syncState.checkedAt, 'Never');
+  const scheduleDescription = formatScheduleFrequency(scheduleFrequencyMinutes);
   const syncSummaryClass =
     syncStatus.tone === 'success'
       ? 'ghsync__sync-summary ghsync__sync-summary--success'
@@ -1538,18 +1637,22 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
     }
   }
 
-  async function handleSaveMappings(event: React.FormEvent<HTMLFormElement>) {
+  async function handleSaveSetup(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setSubmittingMappings(true);
+    setSubmittingSetup(true);
 
     try {
       const companyId = hostContext.companyId;
       if (!companyId) {
-        throw new Error('Company context is required to save repositories.');
+        throw new Error('Company context is required to save setup.');
       }
 
       if (tokenStatus !== 'valid') {
         throw new Error('Validate a GitHub token first.');
+      }
+
+      if (scheduleFrequencyError) {
+        throw new Error(scheduleFrequencyError);
       }
 
       const resolvedMappings: RepositoryMapping[] = [];
@@ -1587,18 +1690,22 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
 
       const result = await saveRegistration({
         mappings: resolvedMappings,
-        syncState: form.syncState
+        syncState: form.syncState,
+        scheduleFrequencyMinutes
       }) as GitHubSyncSettings;
 
       setForm((current) => ({
         ...current,
         mappings: result.mappings.length > 0 ? result.mappings : [createEmptyMapping(0)],
         syncState: result.syncState,
+        scheduleFrequencyMinutes: normalizeScheduleFrequencyMinutes(result.scheduleFrequencyMinutes),
         updatedAt: result.updatedAt
       }));
+      setScheduleFrequencyDraft(String(normalizeScheduleFrequencyMinutes(result.scheduleFrequencyMinutes)));
 
       toast({
-        title: resolvedMappings.length > 0 ? 'Repositories saved' : 'Repositories cleared',
+        title: 'GitHub sync setup saved',
+        body: `Automatic sync runs ${scheduleDescription}.`,
         tone: 'success'
       });
 
@@ -1609,12 +1716,12 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
       }
     } catch (error) {
       toast({
-        title: 'Repositories could not be saved',
-        body: error instanceof Error ? error.message : 'Unable to save repositories.',
+        title: 'Setup could not be saved',
+        body: error instanceof Error ? error.message : 'Unable to save GitHub sync setup.',
         tone: 'error'
       });
     } finally {
-      setSubmittingMappings(false);
+      setSubmittingSetup(false);
     }
   }
 
@@ -1735,11 +1842,11 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
                 </div>
               </form>
             ) : (
-                <div className="ghsync__connected">
-                  <div>
+              <div className="ghsync__connected">
+                <div>
                   <strong>{validatedLogin ? `Authenticated as ${validatedLogin}` : 'GitHub token valid'}</strong>
                   <span>{validatedLogin ? 'Validated with GitHub and stored as a company secret.' : 'Validated with GitHub and stored as a company secret.'}</span>
-                  </div>
+                </div>
                 <button
                   type="button"
                   className="ghsync__button ghsync__button--secondary"
@@ -1759,7 +1866,7 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
             <div className="ghsync__section-head">
               <div className="ghsync__section-copy">
                 <h4>Repositories</h4>
-                <p>{repositoriesUnlocked ? 'Map each GitHub repository to a Paperclip project. Use owner/repo or a full GitHub URL.' : 'Unlocks after the token is valid.'}</p>
+                <p>{repositoriesUnlocked ? 'Map each GitHub repository to a Paperclip project. Save changes from the Sync section below.' : 'Unlocks after the token is valid.'}</p>
               </div>
               <span className={`ghsync__badge ${getToneClass(!repositoriesUnlocked ? 'neutral' : savedMappingCount > 0 ? 'success' : 'info')}`}>
                 {!repositoriesUnlocked ? 'Locked' : savedMappingCount > 0 ? `${savedMappingCount} saved` : 'Open'}
@@ -1775,7 +1882,7 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
                 <span className="ghsync__badge ghsync__badge--neutral">Locked</span>
               </div>
             ) : (
-              <form className="ghsync__stack" onSubmit={handleSaveMappings}>
+              <div className="ghsync__stack">
                 <div className="ghsync__mapping-list">
                   {mappings.map((mapping, index) => {
                     const canRemove = mappings.length > 1 || mapping.repositoryUrl.trim() !== '' || mapping.paperclipProjectName.trim() !== '';
@@ -1841,19 +1948,12 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
                     >
                       Add repository
                     </button>
-                    <button
-                      type="submit"
-                      className="ghsync__button ghsync__button--primary"
-                      disabled={!canSaveMappings}
-                    >
-                      {submittingMappings ? 'Saving…' : 'Save repositories'}
-                    </button>
                   </div>
                   <p className="ghsync__note">
-                    {savedMappingCount > 0 ? `${savedMappingCount} saved.` : 'Save at least one repository to unlock sync.'}
+                    {savedMappingCount > 0 ? `${savedMappingCount} saved. Use Sync below to save repository changes and cadence updates.` : 'Add at least one repository, then save setup from the Sync section below.'}
                   </p>
                 </div>
-              </form>
+              </div>
             )}
           </section>
 
@@ -1861,54 +1961,104 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
             <div className="ghsync__section-head">
               <div className="ghsync__section-copy">
                 <h4>Sync</h4>
-                <p>{syncUnlocked ? 'Run sync when you need it and keep the status compact.' : tokenStatus === 'valid' ? 'Unlocks after at least one repository is saved.' : 'Unlocks after the token is valid and repository setup is complete.'}</p>
+                <p>{repositoriesUnlocked ? `Set the automatic sync cadence in minutes and save setup here. Manual sync stays available after at least one repository mapping is saved.` : 'Unlocks after the token is valid and repository setup is complete.'}</p>
               </div>
               <span className={`ghsync__badge ${getToneClass(syncStatus.tone)}`}>{syncStatus.label}</span>
             </div>
 
-            {!syncUnlocked ? (
+            {!repositoriesUnlocked ? (
               <div className="ghsync__locked">
                 <div>
                   <strong>Sync is locked</strong>
-                  <span>{tokenStatus === 'valid' ? 'Save at least one repository mapping first.' : tokenStatus === 'invalid' ? 'Save a valid GitHub token first.' : 'Validate the token first.'}</span>
+                  <span>{tokenStatus === 'invalid' ? 'Save a valid GitHub token first.' : 'Validate the token first.'}</span>
                 </div>
                 <span className="ghsync__badge ghsync__badge--neutral">Locked</span>
               </div>
             ) : (
               <div className="ghsync__stack">
-                <div className="ghsync__stats">
-                  <div className="ghsync__stat">
-                    <span>Checked</span>
-                    <strong>{form.syncState.syncedIssuesCount ?? 0}</strong>
+                <form className="ghsync__schedule-card" onSubmit={handleSaveSetup}>
+                  <div className="ghsync__field">
+                    <label htmlFor="sync-frequency-minutes">Automatic sync cadence</label>
+                    <input
+                      id="sync-frequency-minutes"
+                      className="ghsync__input"
+                      type="number"
+                      inputMode="numeric"
+                      min={1}
+                      step={1}
+                      value={scheduleFrequencyDraft}
+                      onChange={(event) => {
+                        setScheduleFrequencyDraft(event.currentTarget.value);
+                      }}
+                      placeholder="15"
+                    />
+                    <p className={`ghsync__hint${scheduleFrequencyError ? ' ghsync__hint--error' : ''}`}>
+                      {scheduleFrequencyError ?? 'Enter minutes between automatic sync runs.'}
+                    </p>
                   </div>
-                  <div className="ghsync__stat">
-                    <span>Created</span>
-                    <strong>{form.syncState.createdIssuesCount ?? 0}</strong>
-                  </div>
-                  <div className="ghsync__stat">
-                    <span>Skipped</span>
-                    <strong>{form.syncState.skippedIssuesCount ?? 0}</strong>
-                  </div>
-                </div>
 
-                <div className={syncSummaryClass}>
-                  <div>
-                    <strong>{form.syncState.message ?? 'Ready to sync.'}</strong>
-                    <span>
-                      Last trigger: {form.syncState.lastRunTrigger ?? 'none'}
-                      {' · '}
-                      Last checked: {form.syncState.checkedAt ? formatDate(form.syncState.checkedAt) : 'never'}
-                    </span>
+                  <div className="ghsync__schedule-meta">
+                    <strong>Auto-sync {scheduleDescription}</strong>
+                    <span>Save setup to persist repository mappings and cadence changes.</span>
+                    <div className="ghsync__button-row">
+                      <button
+                        type="submit"
+                        className="ghsync__button ghsync__button--primary"
+                        disabled={!canSaveSetup}
+                      >
+                        {submittingSetup ? 'Saving…' : 'Save setup'}
+                      </button>
+                    </div>
                   </div>
-                  <button
-                    type="button"
-                    className="ghsync__button ghsync__button--primary"
-                    onClick={handleRunSyncNow}
-                    disabled={runningSync || settings.loading}
-                  >
-                    {runningSync ? 'Running…' : 'Run sync now'}
-                  </button>
-                </div>
+                </form>
+
+                {!syncUnlocked ? (
+                  <div className="ghsync__locked">
+                    <div>
+                      <strong>Manual sync is locked</strong>
+                      <span>Save at least one repository mapping to run sync manually.</span>
+                    </div>
+                    <span className="ghsync__badge ghsync__badge--neutral">Locked</span>
+                  </div>
+                ) : (
+                  <>
+                    <div className="ghsync__stats">
+                      <div className="ghsync__stat">
+                        <span>Checked</span>
+                        <strong>{form.syncState.syncedIssuesCount ?? 0}</strong>
+                      </div>
+                      <div className="ghsync__stat">
+                        <span>Created</span>
+                        <strong>{form.syncState.createdIssuesCount ?? 0}</strong>
+                      </div>
+                      <div className="ghsync__stat">
+                        <span>Skipped</span>
+                        <strong>{form.syncState.skippedIssuesCount ?? 0}</strong>
+                      </div>
+                    </div>
+
+                    <div className={syncSummaryClass}>
+                      <div>
+                        <strong>{form.syncState.message ?? 'Ready to sync.'}</strong>
+                        <span>
+                          Auto-sync: {scheduleDescription}
+                          {' · '}
+                          Last trigger: {form.syncState.lastRunTrigger ?? 'none'}
+                          {' · '}
+                          Last checked: {form.syncState.checkedAt ? formatDate(form.syncState.checkedAt) : 'never'}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        className="ghsync__button ghsync__button--primary"
+                        onClick={handleRunSyncNow}
+                        disabled={runningSync || settings.loading}
+                      >
+                        {runningSync ? 'Running…' : 'Run sync now'}
+                      </button>
+                    </div>
+                  </>
+                )}
               </div>
             )}
           </section>
@@ -1946,13 +2096,17 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
                 <strong>Sync</strong>
                 <span className={`ghsync__badge ${getToneClass(syncStatus.tone)}`}>{syncStatus.label}</span>
               </div>
-              <span>{!syncUnlocked ? (tokenStatus === 'valid' ? 'Waiting for a saved repository.' : 'Waiting for valid GitHub access.') : form.syncState.checkedAt ? `Last run ${lastSync}.` : 'Ready to run on demand.'}</span>
+              <span>{!syncUnlocked ? (tokenStatus === 'valid' ? `Waiting for a saved repository. Auto-sync is set to ${scheduleDescription}.` : 'Waiting for valid GitHub access.') : form.syncState.checkedAt ? `Auto-sync ${scheduleDescription}. Last run ${lastSync}.` : `Auto-sync ${scheduleDescription}. Ready to run on demand.`}</span>
             </div>
 
             <div className="ghsync__detail-list">
               <div className="ghsync__detail">
                 <span className="ghsync__detail-label">Last saved</span>
                 <strong className="ghsync__detail-value">{lastUpdated}</strong>
+              </div>
+              <div className="ghsync__detail">
+                <span className="ghsync__detail-label">Auto-sync</span>
+                <strong className="ghsync__detail-value">{scheduleDescription}</strong>
               </div>
               <div className="ghsync__detail">
                 <span className="ghsync__detail-label">Last sync</span>
@@ -1982,7 +2136,9 @@ export function GitHubSyncDashboardWidget(): React.JSX.Element {
   const tokenValid = Boolean(current.githubTokenConfigured);
   const savedMappingCount = getComparableMappings(current.mappings ?? []).length;
   const syncUnlocked = tokenValid && savedMappingCount > 0;
-  const summary = getDashboardSummary(tokenValid, savedMappingCount, syncState, runningSync);
+  const scheduleFrequencyMinutes = normalizeScheduleFrequencyMinutes(current.scheduleFrequencyMinutes);
+  const scheduleDescription = formatScheduleFrequency(scheduleFrequencyMinutes);
+  const summary = getDashboardSummary(tokenValid, savedMappingCount, syncState, runningSync, scheduleFrequencyMinutes);
   const lastSync = formatDate(syncState.checkedAt, 'Never');
   const syncedIssuesCount = syncState.syncedIssuesCount ?? 0;
   const createdIssuesCount = syncState.createdIssuesCount ?? 0;
@@ -2049,6 +2205,8 @@ export function GitHubSyncDashboardWidget(): React.JSX.Element {
             <p>{summary.body}</p>
             <div className="ghsync-widget__meta">
               <span>{savedMappingCount} {savedMappingCount === 1 ? 'repository' : 'repositories'}</span>
+              <span className="ghsync-widget__meta-dot" aria-hidden="true" />
+              <span>Auto-sync {scheduleDescription}</span>
               <span className="ghsync-widget__meta-dot" aria-hidden="true" />
               <span>Last sync {lastSync}</span>
             </div>

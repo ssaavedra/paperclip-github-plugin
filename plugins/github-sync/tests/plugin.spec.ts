@@ -11,6 +11,7 @@ test('manifest exposes GitHub Sync dashboard and settings UI metadata, config sc
   assert.equal(manifest.apiVersion, 1);
   assert.equal(manifest.entrypoints.worker, './dist/worker.js');
   assert.equal(manifest.jobs?.[0]?.jobKey, 'sync.github-issues');
+  assert.equal(manifest.jobs?.[0]?.schedule, '* * * * *');
   assert.ok(manifest.capabilities.some((capability) => capability === 'ui.dashboardWidget.register'));
   assert.equal((manifest.instanceConfigSchema as { properties?: Record<string, unknown> }).properties?.githubTokenRef ? 'present' : 'missing', 'present');
   const settingsSlot = manifest.ui?.slots?.find((slot) => slot.type === 'settingsPage');
@@ -59,6 +60,7 @@ test('worker saves normalized mappings with resolved project identifiers supplie
       skippedIssuesCount: undefined,
       lastRunTrigger: undefined
     },
+    scheduleFrequencyMinutes: 15,
     updatedAt: (result as { updatedAt: string }).updatedAt
   });
 });
@@ -101,8 +103,26 @@ test('worker normalizes owner/repo slugs to canonical GitHub URLs when saving ma
       skippedIssuesCount: undefined,
       lastRunTrigger: undefined
     },
+    scheduleFrequencyMinutes: 15,
     updatedAt: (result as { updatedAt: string }).updatedAt
   });
+});
+
+test('worker saves a configured schedule frequency alongside mappings', async () => {
+  const harness = createTestHarness({ manifest });
+  await plugin.definition.setup(harness.ctx);
+
+  const result = await harness.performAction('settings.saveRegistration', {
+    scheduleFrequencyMinutes: 17
+  }) as {
+    mappings: unknown[];
+    syncState: { status: string };
+    scheduleFrequencyMinutes: number;
+  };
+
+  assert.equal(result.scheduleFrequencyMinutes, 17);
+  assert.equal(result.syncState.status, 'idle');
+  assert.deepEqual(result.mappings, []);
 });
 
 test('worker validates a GitHub token by reaching the GitHub API', async () => {
@@ -153,4 +173,80 @@ test('worker reports sync error when configuration is incomplete', async () => {
   assert.equal(result.syncState.status, 'error');
   assert.equal(result.syncState.message, 'Configure a GitHub token secret before running sync.');
   assert.equal(result.syncState.lastRunTrigger, 'manual');
+});
+
+test('scheduled job skips runs that are not yet due for the configured cadence', async () => {
+  const harness = createTestHarness({ manifest });
+  await plugin.definition.setup(harness.ctx);
+
+  await harness.ctx.state.set(
+    {
+      scopeKind: 'instance',
+      stateKey: 'github-sync-settings'
+    },
+    {
+      mappings: [],
+      syncState: {
+        status: 'idle',
+        checkedAt: '2026-04-09T10:00:00.000Z'
+      },
+      scheduleFrequencyMinutes: 60,
+      updatedAt: '2026-04-09T10:00:00.000Z'
+    }
+  );
+
+  await harness.runJob('sync.github-issues', {
+    trigger: 'schedule',
+    scheduledAt: '2026-04-09T10:30:00.000Z'
+  });
+
+  const state = harness.getState({
+    scopeKind: 'instance',
+    stateKey: 'github-sync-settings'
+  }) as {
+    scheduleFrequencyMinutes: number;
+    syncState: { status: string; checkedAt?: string; message?: string };
+  };
+
+  assert.equal(state.scheduleFrequencyMinutes, 60);
+  assert.equal(state.syncState.status, 'idle');
+  assert.equal(state.syncState.checkedAt, '2026-04-09T10:00:00.000Z');
+  assert.equal(state.syncState.message, undefined);
+});
+
+test('scheduled job runs once the configured cadence has elapsed', async () => {
+  const harness = createTestHarness({ manifest });
+  await plugin.definition.setup(harness.ctx);
+
+  await harness.ctx.state.set(
+    {
+      scopeKind: 'instance',
+      stateKey: 'github-sync-settings'
+    },
+    {
+      mappings: [],
+      syncState: {
+        status: 'idle',
+        checkedAt: '2026-04-09T09:00:00.000Z'
+      },
+      scheduleFrequencyMinutes: 30,
+      updatedAt: '2026-04-09T09:00:00.000Z'
+    }
+  );
+
+  await harness.runJob('sync.github-issues', {
+    trigger: 'schedule',
+    scheduledAt: '2026-04-09T09:45:00.000Z'
+  });
+
+  const state = harness.getState({
+    scopeKind: 'instance',
+    stateKey: 'github-sync-settings'
+  }) as {
+    syncState: { status: string; message?: string; lastRunTrigger?: string };
+  };
+
+  assert.equal(state.syncState.status, 'error');
+  assert.equal(state.syncState.message, 'Configure a GitHub token secret before running sync.');
+  assert.equal(state.syncState.lastRunTrigger, 'schedule');
 });

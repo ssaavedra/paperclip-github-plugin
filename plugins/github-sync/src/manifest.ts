@@ -1,6 +1,7 @@
 import type { PaperclipPluginManifestV1 } from '@paperclipai/plugin-sdk';
 
 const DASHBOARD_WIDGET_CAPABILITY = 'ui.dashboardWidget.register' as unknown as PaperclipPluginManifestV1['capabilities'][number];
+const SCHEDULE_TICK_CRON = '* * * * *';
 
 export const manifest: PaperclipPluginManifestV1 = {
   id: 'github-sync',
@@ -35,8 +36,8 @@ export const manifest: PaperclipPluginManifestV1 = {
     {
       jobKey: 'sync.github-issues',
       displayName: 'Sync GitHub issues',
-      description: 'Imports GitHub repository issues into Paperclip.',
-      schedule: '*/15 * * * *'
+      description: 'Checks for GitHub issue updates and syncs them on the configured cadence.',
+      schedule: SCHEDULE_TICK_CRON
     }
   ],
   entrypoints: {
