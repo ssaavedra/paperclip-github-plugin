@@ -31,6 +31,11 @@
       "sourceType": "github",
       "computedHash": "27d7a689e0b60d34d920a9b2f9fb423eaa4652e4ad897f850c5371a437fa1538"
     },
+    "playwright-cli": {
+      "source": "microsoft/playwright-cli",
+      "sourceType": "github",
+      "computedHash": "45b90b409fb80cf08ee4e8b72377bddacfac3d1c1fac69bff5fd5342fad26adf"
+    },
     "web-design-guidelines": {
       "source": "vercel-labs/agent-skills",
       "sourceType": "github",
