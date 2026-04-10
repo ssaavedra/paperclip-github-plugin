@@ -375,6 +375,7 @@ async function main() {
   console.log(`Open: ${manualUrl}`);
   console.log(`Company: ${company?.name ?? 'Dummy Company'}`);
   console.log(`State dir: ${stateRoot}`);
+  console.log(`Logs dir: ${join(dataDir, 'logs')}`);
   console.log('The URL has been opened in your default browser.');
   console.log('Press Ctrl+C when you are done inspecting the instance.');
   console.log('');

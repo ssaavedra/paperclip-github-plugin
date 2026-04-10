@@ -16,7 +16,46 @@ interface SyncRunState {
   syncedIssuesCount?: number;
   createdIssuesCount?: number;
   skippedIssuesCount?: number;
+  erroredIssuesCount?: number;
   lastRunTrigger?: 'manual' | 'schedule' | 'retry';
+  progress?: SyncProgressState;
+  errorDetails?: SyncErrorDetails;
+}
+
+type SyncProgressPhase = 'preparing' | 'importing' | 'syncing';
+type SyncConfigurationIssue = 'missing_token' | 'missing_mapping';
+
+interface SyncProgressState {
+  phase?: SyncProgressPhase;
+  totalRepositoryCount?: number;
+  currentRepositoryIndex?: number;
+  currentRepositoryUrl?: string;
+  completedIssueCount?: number;
+  totalIssueCount?: number;
+  currentIssueNumber?: number;
+  detailLabel?: string;
+}
+
+type SyncFailurePhase =
+  | 'configuration'
+  | 'loading_paperclip_labels'
+  | 'listing_github_issues'
+  | 'building_import_plan'
+  | 'importing_issue'
+  | 'syncing_labels'
+  | 'syncing_description'
+  | 'evaluating_github_status'
+  | 'updating_paperclip_status';
+
+interface SyncErrorDetails {
+  phase?: SyncFailurePhase;
+  configurationIssue?: SyncConfigurationIssue;
+  repositoryUrl?: string;
+  githubIssueNumber?: number;
+  rawMessage?: string;
+  suggestedAction?: string;
+  rateLimitResetAt?: string;
+  rateLimitResource?: string;
 }
 
 interface GitHubSyncSettings {
@@ -25,6 +64,7 @@ interface GitHubSyncSettings {
   scheduleFrequencyMinutes: number;
   paperclipApiBaseUrl?: string;
   githubTokenConfigured?: boolean;
+  totalSyncedIssuesCount?: number;
   updatedAt?: string;
 }
 
@@ -151,6 +191,12 @@ const DARK_PALETTE: ThemePalette = {
 };
 
 const DEFAULT_SCHEDULE_FREQUENCY_MINUTES = 15;
+const SYNC_POLL_INTERVAL_MS = 750;
+const MISSING_GITHUB_TOKEN_SYNC_MESSAGE = 'Configure a GitHub token secret before running sync.';
+const MISSING_GITHUB_TOKEN_SYNC_ACTION = 'Open settings, add a GitHub token secret, validate it, and then run sync again.';
+const MISSING_MAPPING_SYNC_MESSAGE = 'Save at least one mapping with a created Paperclip project before running sync.';
+const MISSING_MAPPING_SYNC_ACTION =
+  'Open settings, add a repository mapping, let Paperclip create the target project, and then retry sync.';
 
 const EMPTY_SETTINGS: GitHubSyncSettings = {
   mappings: [],
@@ -159,6 +205,235 @@ const EMPTY_SETTINGS: GitHubSyncSettings = {
   },
   scheduleFrequencyMinutes: DEFAULT_SCHEDULE_FREQUENCY_MINUTES
 };
+
+function createIdleSyncState(): SyncRunState {
+  return {
+    status: 'idle'
+  };
+}
+
+function getLegacySyncConfigurationIssue(syncState: SyncRunState): SyncConfigurationIssue | null {
+  if (syncState.status !== 'error' || syncState.errorDetails?.phase !== 'configuration') {
+    return null;
+  }
+
+  const message = syncState.message?.trim();
+  const suggestedAction = syncState.errorDetails?.suggestedAction?.trim();
+
+  if (message === MISSING_GITHUB_TOKEN_SYNC_MESSAGE || suggestedAction === MISSING_GITHUB_TOKEN_SYNC_ACTION) {
+    return 'missing_token';
+  }
+
+  if (message === MISSING_MAPPING_SYNC_MESSAGE || suggestedAction === MISSING_MAPPING_SYNC_ACTION) {
+    return 'missing_mapping';
+  }
+
+  return null;
+}
+
+function getSyncConfigurationIssue(syncState: SyncRunState): SyncConfigurationIssue | null {
+  return syncState.errorDetails?.configurationIssue ?? getLegacySyncConfigurationIssue(syncState);
+}
+
+function getDisplaySyncState(
+  syncState: SyncRunState,
+  setup: {
+    hasToken: boolean;
+    hasMappings: boolean;
+  }
+): SyncRunState {
+  const configurationIssue = getSyncConfigurationIssue(syncState);
+  if (!configurationIssue) {
+    return syncState;
+  }
+
+  if (configurationIssue === 'missing_token' && setup.hasToken) {
+    return createIdleSyncState();
+  }
+
+  if (configurationIssue === 'missing_mapping' && setup.hasMappings) {
+    return createIdleSyncState();
+  }
+
+  return syncState;
+}
+
+function getGitHubRateLimitResourceLabel(resource?: string): string | null {
+  switch (resource?.trim().toLowerCase()) {
+    case 'core':
+      return 'REST API';
+    case 'graphql':
+      return 'GraphQL API';
+    case 'search':
+      return 'Search API';
+    default:
+      return resource?.trim() ? `GitHub ${resource.trim()} API` : null;
+  }
+}
+
+function getActiveRateLimitPause(syncState: SyncRunState, referenceTimeMs = Date.now()): {
+  resetAt: string;
+  resource?: string;
+} | null {
+  if (syncState.status !== 'error' || !syncState.errorDetails?.rateLimitResetAt) {
+    return null;
+  }
+
+  const resetAt = syncState.errorDetails.rateLimitResetAt.trim();
+  const resetTimeMs = Date.parse(resetAt);
+  if (!Number.isFinite(resetTimeMs) || resetTimeMs <= referenceTimeMs) {
+    return null;
+  }
+
+  return {
+    resetAt,
+    ...(syncState.errorDetails.rateLimitResource ? { resource: syncState.errorDetails.rateLimitResource } : {})
+  };
+}
+
+function getSyncToastTitle(syncState: SyncRunState): string {
+  if (getActiveRateLimitPause(syncState)) {
+    return 'GitHub sync is paused';
+  }
+
+  if (syncState.status === 'running') {
+    return 'GitHub sync is running';
+  }
+
+  return syncState.status === 'error' ? 'GitHub sync needs attention' : 'GitHub sync finished';
+}
+
+function getSyncToastBody(syncState: SyncRunState): string {
+  if (syncState.message?.trim()) {
+    return syncState.message.trim();
+  }
+
+  if (syncState.status === 'running') {
+    return 'GitHub sync is running in the background.';
+  }
+
+  return 'GitHub sync completed.';
+}
+
+function getSyncToastTone(syncState: SyncRunState): 'info' | 'error' | 'success' {
+  if (getActiveRateLimitPause(syncState)) {
+    return 'info';
+  }
+
+  if (syncState.status === 'running') {
+    return 'info';
+  }
+
+  return syncState.status === 'error' ? 'error' : 'success';
+}
+
+const SHARED_PROGRESS_STYLES = `
+.ghsync-progress {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border-radius: 10px;
+  border: 1px solid var(--ghsync-info-border);
+  background: var(--ghsync-info-bg);
+}
+
+.ghsync-progress--compact {
+  gap: 8px;
+  padding: 12px;
+}
+
+.ghsync-progress__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.ghsync-progress__copy strong {
+  display: block;
+  font-size: 13px;
+  color: var(--ghsync-title);
+}
+
+.ghsync-progress__copy span {
+  display: block;
+  margin-top: 4px;
+  color: var(--ghsync-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ghsync-progress__pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--ghsync-info-border);
+  background: var(--ghsync-surfaceAlt);
+  color: var(--ghsync-info-text);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.ghsync-progress__track {
+  position: relative;
+  overflow: hidden;
+  height: 10px;
+  border-radius: 999px;
+  border: 1px solid var(--ghsync-border-soft);
+  background: var(--ghsync-surfaceRaised);
+}
+
+.ghsync-progress__fill {
+  height: 100%;
+  min-width: 12px;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--ghsync-info-border) 0%, var(--ghsync-info-text) 100%);
+  transition: width 220ms ease;
+}
+
+.ghsync-progress__fill--indeterminate {
+  width: 34%;
+  animation: ghsync-progress-slide 1.4s ease-in-out infinite;
+}
+
+.ghsync-progress__meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.ghsync-progress__meta span {
+  color: var(--ghsync-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+@keyframes ghsync-progress-slide {
+  0% {
+    transform: translateX(-120%);
+  }
+
+  100% {
+    transform: translateX(320%);
+  }
+}
+
+@media (max-width: 640px) {
+  .ghsync-progress__header,
+  .ghsync-progress__meta {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
+`;
 
 const PAGE_STYLES = `
 .ghsync {
@@ -265,6 +540,68 @@ const PAGE_STYLES = `
   border-color: var(--ghsync-danger-border);
   background: var(--ghsync-danger-bg);
   color: var(--ghsync-danger-text);
+}
+
+.ghsync-diagnostics {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border-radius: 10px;
+  border: 1px solid var(--ghsync-dangerBorder);
+  background: var(--ghsync-dangerBg);
+}
+
+.ghsync-diagnostics__header {
+  display: grid;
+  gap: 4px;
+}
+
+.ghsync-diagnostics__header strong {
+  font-size: 13px;
+  color: var(--ghsync-dangerText);
+}
+
+.ghsync-diagnostics__header span {
+  color: var(--ghsync-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ghsync-diagnostics__grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+}
+
+.ghsync-diagnostics__item,
+.ghsync-diagnostics__block {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid var(--ghsync-dangerBorder);
+  background: var(--ghsync-surfaceAlt);
+}
+
+.ghsync-diagnostics__label {
+  color: var(--ghsync-dangerText);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.ghsync-diagnostics__value {
+  color: var(--ghsync-title);
+  font-size: 13px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.ghsync-diagnostics__value--code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
 }
 
 .ghsync__section {
@@ -393,6 +730,11 @@ const PAGE_STYLES = `
 
 .ghsync__input[readonly] {
   opacity: 0.78;
+}
+
+.ghsync__input:disabled {
+  opacity: 0.72;
+  cursor: not-allowed;
 }
 
 .ghsync__hint,
@@ -574,7 +916,7 @@ const PAGE_STYLES = `
 .ghsync__stats {
   display: grid;
   gap: 10px;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .ghsync__schedule-meta {
@@ -594,21 +936,35 @@ const PAGE_STYLES = `
 }
 
 .ghsync__stat {
+  display: grid;
+  gap: 6px;
   padding: 12px;
+}
+
+.ghsync__stat--emphasized {
+  border-color: var(--ghsync-danger-border);
+  background: var(--ghsync-danger-bg);
 }
 
 .ghsync__stat span {
   display: block;
-  color: var(--ghsync-muted);
-  font-size: 11px;
+  color: var(--ghsync-title);
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .ghsync__stat strong {
   display: block;
-  margin-top: 8px;
   color: var(--ghsync-title);
   font-size: 20px;
   line-height: 1;
+}
+
+.ghsync__stat p {
+  margin: 0;
+  color: var(--ghsync-muted);
+  font-size: 11px;
+  line-height: 1.5;
 }
 
 .ghsync__side-body {
@@ -694,6 +1050,8 @@ const PAGE_STYLES = `
     text-align: left;
   }
 }
+
+${SHARED_PROGRESS_STYLES}
 `;
 
 const WIDGET_STYLES = `
@@ -772,8 +1130,8 @@ const WIDGET_STYLES = `
 
 .ghsync-widget__stats {
   display: grid;
-  gap: 0;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   border-top: 1px solid var(--ghsync-border-soft);
   padding-top: 14px;
 }
@@ -785,28 +1143,38 @@ const WIDGET_STYLES = `
 }
 
 .ghsync-widget__stat {
-  padding: 0 12px;
-  background: transparent;
-  border-left: 1px solid var(--ghsync-border-soft);
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid var(--ghsync-border-soft);
+  border-radius: 10px;
+  background: var(--ghsync-surfaceAlt);
 }
 
-.ghsync-widget__stat:first-child {
-  padding-left: 0;
-  border-left: 0;
+.ghsync-widget__stat--emphasized {
+  border-color: var(--ghsync-danger-border);
+  background: var(--ghsync-dangerBg);
 }
 
 .ghsync-widget__stat span {
   display: block;
-  font-size: 11px;
-  color: var(--ghsync-muted);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ghsync-title);
 }
 
 .ghsync-widget__stat strong {
   display: block;
-  margin-top: 6px;
-  font-size: 22px;
+  font-size: 24px;
   line-height: 1;
   color: var(--ghsync-title);
+}
+
+.ghsync-widget__stat p {
+  margin: 0;
+  color: var(--ghsync-muted);
+  font-size: 11px;
+  line-height: 1.5;
 }
 
 .ghsync-widget__summary {
@@ -834,6 +1202,68 @@ const WIDGET_STYLES = `
   color: var(--ghsync-danger-text);
   font-size: 12px;
   line-height: 1.5;
+}
+
+.ghsync-diagnostics {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border-radius: 10px;
+  border: 1px solid var(--ghsync-dangerBorder);
+  background: var(--ghsync-dangerBg);
+}
+
+.ghsync-diagnostics__header {
+  display: grid;
+  gap: 4px;
+}
+
+.ghsync-diagnostics__header strong {
+  font-size: 13px;
+  color: var(--ghsync-dangerText);
+}
+
+.ghsync-diagnostics__header span {
+  color: var(--ghsync-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ghsync-diagnostics__grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
+
+.ghsync-diagnostics__item,
+.ghsync-diagnostics__block {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid var(--ghsync-dangerBorder);
+  background: var(--ghsync-surfaceAlt);
+}
+
+.ghsync-diagnostics__label {
+  color: var(--ghsync-dangerText);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.ghsync-diagnostics__value {
+  color: var(--ghsync-title);
+  font-size: 13px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.ghsync-diagnostics__value--code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
 }
 
 .ghsync-widget__actions {
@@ -962,6 +1392,8 @@ const WIDGET_STYLES = `
     flex: 1 1 auto;
   }
 }
+
+${SHARED_PROGRESS_STYLES}
 `;
 
 function createEmptyMapping(index: number): RepositoryMapping {
@@ -1073,6 +1505,38 @@ function parseRepositoryReference(repositoryInput: string): ParsedRepositoryRefe
   } catch {
     return null;
   }
+}
+
+function formatProjectNameFromRepository(repositoryInput: string): string {
+  const parsedRepository = parseRepositoryReference(repositoryInput);
+  const repositoryName = parsedRepository?.repo
+    ?? repositoryInput.trim().replace(/\/+$/, '').split('/').pop()?.replace(/\.git$/i, '')
+    ?? '';
+
+  if (!repositoryName) {
+    return '';
+  }
+
+  return repositoryName
+    .split(/[-_.]+/)
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0)
+    .map((segment) => segment.charAt(0).toUpperCase() + segment.slice(1))
+    .join(' ');
+}
+
+function shouldAutofillProjectName(mapping: RepositoryMapping): boolean {
+  if (mapping.paperclipProjectId) {
+    return false;
+  }
+
+  const currentProjectName = mapping.paperclipProjectName.trim();
+  if (!currentProjectName) {
+    return true;
+  }
+
+  const previousSuggestedProjectName = formatProjectNameFromRepository(mapping.repositoryUrl);
+  return previousSuggestedProjectName !== '' && currentProjectName === previousSuggestedProjectName;
 }
 
 function getPaperclipApiBaseUrl(): string | undefined {
@@ -1255,6 +1719,10 @@ function getSyncStatus(syncState: SyncRunState, runningSync: boolean, syncUnlock
     return { label: 'Running', tone: 'info' };
   }
 
+  if (getActiveRateLimitPause(syncState)) {
+    return { label: 'Paused', tone: 'warning' };
+  }
+
   if (syncState.status === 'error') {
     return { label: 'Needs attention', tone: 'danger' };
   }
@@ -1321,6 +1789,185 @@ function resolvePluginSettingsHref(records: unknown): string {
   return SETTINGS_INDEX_HREF;
 }
 
+function formatSyncProgressRepository(repositoryUrl?: string): string | null {
+  if (!repositoryUrl?.trim()) {
+    return null;
+  }
+
+  const parsed = parseRepositoryReference(repositoryUrl);
+  if (parsed) {
+    return `${parsed.owner}/${parsed.repo}`;
+  }
+
+  return repositoryUrl.trim();
+}
+
+function getRunningSyncProgressModel(syncState: SyncRunState): {
+  title: string;
+  description: string;
+  repositoryLabel?: string;
+  repositoryPosition?: string;
+  issueProgressLabel?: string;
+  currentIssueLabel?: string;
+  completedIssueCount?: number;
+  totalIssueCount?: number;
+  percent: number | null;
+  indeterminate: boolean;
+} | null {
+  if (syncState.status !== 'running') {
+    return null;
+  }
+
+  const progress = syncState.progress;
+  const repositoryLabel = formatSyncProgressRepository(progress?.currentRepositoryUrl) ?? undefined;
+  const repositoryPosition =
+    progress?.currentRepositoryIndex && progress.totalRepositoryCount
+      ? `Repository ${progress.currentRepositoryIndex} of ${progress.totalRepositoryCount}`
+      : progress?.totalRepositoryCount
+        ? `${progress.totalRepositoryCount} ${progress.totalRepositoryCount === 1 ? 'repository' : 'repositories'}`
+        : undefined;
+  const completedIssueCount =
+    typeof progress?.completedIssueCount === 'number' ? Math.max(0, progress.completedIssueCount) : undefined;
+  const totalIssueCount =
+    typeof progress?.totalIssueCount === 'number' ? Math.max(0, progress.totalIssueCount) : undefined;
+  const detailLabel = progress?.detailLabel?.trim() ? progress.detailLabel.trim() : undefined;
+  const indeterminate = totalIssueCount === undefined;
+  const percent =
+    totalIssueCount === undefined
+      ? null
+      : totalIssueCount === 0
+        ? 100
+        : Math.max(0, Math.min(100, ((completedIssueCount ?? 0) / totalIssueCount) * 100));
+  const currentIssueLabel =
+    progress?.currentIssueNumber !== undefined
+      ? progress.phase === 'importing'
+        ? `Importing GitHub issue #${progress.currentIssueNumber}`
+        : progress.phase === 'syncing'
+          ? `Syncing GitHub issue #${progress.currentIssueNumber}`
+          : `Working on GitHub issue #${progress.currentIssueNumber}`
+      : repositoryLabel
+        ? `Current repository: ${repositoryLabel}`
+        : undefined;
+
+  switch (progress?.phase) {
+    case 'importing': {
+      const importingIssueProgressLabel =
+        totalIssueCount !== undefined
+          ? totalIssueCount === 0
+            ? 'No issues to process'
+            : `Processed ${Math.min(completedIssueCount ?? 0, totalIssueCount)} of ${totalIssueCount} issues`
+          : detailLabel;
+      return {
+        title: repositoryLabel ? `Importing issues from ${repositoryLabel}` : 'Importing GitHub issues',
+        description: repositoryLabel
+          ? `Creating missing Paperclip issues and repairing existing imports from ${repositoryLabel}.`
+          : 'Creating missing Paperclip issues and repairing existing imports.',
+        ...(repositoryLabel ? { repositoryLabel } : {}),
+        ...(repositoryPosition ? { repositoryPosition } : {}),
+        ...(importingIssueProgressLabel ? { issueProgressLabel: importingIssueProgressLabel } : {}),
+        ...(currentIssueLabel ? { currentIssueLabel } : {}),
+        ...(completedIssueCount !== undefined ? { completedIssueCount } : {}),
+        ...(totalIssueCount !== undefined ? { totalIssueCount } : {}),
+        percent,
+        indeterminate
+      };
+    }
+    case 'syncing': {
+      const syncingIssueProgressLabel =
+        totalIssueCount !== undefined
+          ? totalIssueCount === 0
+            ? 'No issues to process'
+            : `Processed ${Math.min(completedIssueCount ?? 0, totalIssueCount)} of ${totalIssueCount} issues`
+          : detailLabel;
+      return {
+        title: repositoryLabel ? `Syncing ${repositoryLabel}` : 'Syncing Paperclip issue state',
+        description: repositoryLabel
+          ? `Updating labels, descriptions, and status for imported issues from ${repositoryLabel}.`
+          : 'Updating labels, descriptions, and status for imported issues.',
+        ...(repositoryLabel ? { repositoryLabel } : {}),
+        ...(repositoryPosition ? { repositoryPosition } : {}),
+        ...(syncingIssueProgressLabel ? { issueProgressLabel: syncingIssueProgressLabel } : {}),
+        ...(currentIssueLabel ? { currentIssueLabel } : {}),
+        ...(completedIssueCount !== undefined ? { completedIssueCount } : {}),
+        ...(totalIssueCount !== undefined ? { totalIssueCount } : {}),
+        percent,
+        indeterminate
+      };
+    }
+    default: {
+      const preparingIssueProgressLabel =
+        detailLabel ??
+        (totalIssueCount !== undefined
+          ? totalIssueCount === 0
+            ? 'No issues to process'
+            : `Found ${totalIssueCount} issues to sync`
+          : completedIssueCount !== undefined
+            ? `Scanned ${completedIssueCount} GitHub ${completedIssueCount === 1 ? 'issue' : 'issues'} so far`
+            : undefined);
+      return {
+        title: repositoryLabel ? `Preparing ${repositoryLabel}` : 'Preparing GitHub sync',
+        description:
+          detailLabel ??
+          (repositoryLabel
+            ? `Calculating how many GitHub issues need to be synced for ${repositoryLabel}.`
+            : 'Calculating how many GitHub issues need to be synced.'),
+        ...(repositoryLabel ? { repositoryLabel } : {}),
+        ...(repositoryPosition ? { repositoryPosition } : {}),
+        ...(preparingIssueProgressLabel ? { issueProgressLabel: preparingIssueProgressLabel } : {}),
+        ...(currentIssueLabel ? { currentIssueLabel } : {}),
+        percent: null,
+        indeterminate: true
+      };
+    }
+  }
+}
+
+function getSyncMetricCards(params: {
+  totalSyncedIssuesCount?: number;
+  erroredIssuesCount?: number;
+  syncState: SyncRunState;
+  savedMappingCount: number;
+}): Array<{
+  key: string;
+  value: number;
+  label: string;
+  description: string;
+  emphasized?: boolean;
+}> {
+  const totalSyncedIssuesCount = Math.max(0, params.totalSyncedIssuesCount ?? 0);
+  const erroredIssuesCount = Math.max(0, params.erroredIssuesCount ?? 0);
+
+  return [
+    {
+      key: 'total-synced',
+      value: totalSyncedIssuesCount,
+      label: 'Total issues synced',
+      description:
+        totalSyncedIssuesCount > 0
+          ? 'Across all mapped repositories.'
+          : params.savedMappingCount > 0
+            ? 'No issues imported yet.'
+            : 'Add a repository to start syncing.'
+    },
+    {
+      key: 'errored',
+      value: erroredIssuesCount,
+      label: 'Issues errored',
+      description:
+        params.syncState.status === 'running'
+          ? erroredIssuesCount > 0
+            ? 'Detected so far in this run.'
+            : 'No issue errors detected yet.'
+          : params.syncState.checkedAt
+            ? erroredIssuesCount > 0
+              ? 'From the latest sync run.'
+              : 'No errors in the latest sync run.'
+            : 'No sync run yet.',
+      emphasized: erroredIssuesCount > 0
+    }
+  ];
+}
+
 function getDashboardSummary(
   tokenValid: boolean,
   savedMappingCount: number,
@@ -1329,6 +1976,8 @@ function getDashboardSummary(
   scheduleFrequencyMinutes: number
 ): { label: string; tone: Tone; title: string; body: string } {
   const cadence = formatScheduleFrequency(scheduleFrequencyMinutes);
+  const activeRateLimitPause = getActiveRateLimitPause(syncState);
+  const rateLimitResourceLabel = getGitHubRateLimitResourceLabel(activeRateLimitPause?.resource);
 
   if (!tokenValid) {
     return {
@@ -1349,11 +1998,21 @@ function getDashboardSummary(
   }
 
   if (runningSync || syncState.status === 'running') {
+    const progress = getRunningSyncProgressModel(syncState);
     return {
       label: 'Syncing',
       tone: 'info',
-      title: 'Sync in progress',
-      body: 'GitHub issues are being checked right now.'
+      title: progress?.title ?? 'Sync in progress',
+      body: progress?.description ?? 'GitHub issues are being checked right now. This card refreshes automatically until the run finishes.'
+    };
+  }
+
+  if (activeRateLimitPause) {
+    return {
+      label: 'Paused',
+      tone: 'warning',
+      title: 'GitHub sync paused by rate limit',
+      body: `${rateLimitResourceLabel ?? 'GitHub'} rate limiting paused sync until ${formatDate(activeRateLimitPause.resetAt, activeRateLimitPause.resetAt)}.`
     };
   }
 
@@ -1409,6 +2068,9 @@ function buildThemeVars(theme: ThemePalette, themeMode: ThemeMode): React.CSSPro
     ['--ghsync-dangerBg' as string]: theme.dangerBg,
     ['--ghsync-dangerBorder' as string]: theme.dangerBorder,
     ['--ghsync-dangerText' as string]: theme.dangerText,
+    ['--ghsync-danger-bg' as string]: theme.dangerBg,
+    ['--ghsync-danger-border' as string]: theme.dangerBorder,
+    ['--ghsync-danger-text' as string]: theme.dangerText,
     ['--ghsync-success-bg' as string]: theme.successBg,
     ['--ghsync-success-border' as string]: theme.successBorder,
     ['--ghsync-success-text' as string]: theme.successText,
@@ -1420,6 +2082,222 @@ function buildThemeVars(theme: ThemePalette, themeMode: ThemeMode): React.CSSPro
     ['--ghsync-info-text' as string]: theme.infoText,
     ['--ghsync-shadow' as string]: theme.shadow
   } as React.CSSProperties;
+}
+
+function formatSyncFailurePhase(phase?: SyncFailurePhase): string | null {
+  switch (phase) {
+    case 'configuration':
+      return 'Checking sync configuration';
+    case 'loading_paperclip_labels':
+      return 'Loading Paperclip labels';
+    case 'listing_github_issues':
+      return 'Listing GitHub issues';
+    case 'building_import_plan':
+      return 'Building the GitHub import plan';
+    case 'importing_issue':
+      return 'Importing a GitHub issue';
+    case 'syncing_labels':
+      return 'Syncing issue labels';
+    case 'syncing_description':
+      return 'Syncing issue descriptions';
+    case 'evaluating_github_status':
+      return 'Checking GitHub review and CI status';
+    case 'updating_paperclip_status':
+      return 'Updating Paperclip issue status';
+    default:
+      return null;
+  }
+}
+
+function formatSyncFailureRepository(repositoryUrl?: string): string | null {
+  if (!repositoryUrl?.trim()) {
+    return null;
+  }
+
+  const parsed = parseRepositoryReference(repositoryUrl);
+  if (parsed) {
+    return `${parsed.owner}/${parsed.repo}`;
+  }
+
+  return repositoryUrl.trim();
+}
+
+function getSyncDiagnostics(syncState: SyncRunState): {
+  rows: Array<{ label: string; value: string }>;
+  rawMessage?: string;
+  suggestedAction?: string;
+} | null {
+  if (syncState.status !== 'error') {
+    return null;
+  }
+
+  const rows: Array<{ label: string; value: string }> = [];
+  const repositoryLabel = formatSyncFailureRepository(syncState.errorDetails?.repositoryUrl);
+  const phaseLabel = formatSyncFailurePhase(syncState.errorDetails?.phase);
+  const issueNumber = syncState.errorDetails?.githubIssueNumber;
+  const rateLimitResetAt = syncState.errorDetails?.rateLimitResetAt;
+  const rateLimitResourceLabel = getGitHubRateLimitResourceLabel(syncState.errorDetails?.rateLimitResource);
+
+  if (repositoryLabel) {
+    rows.push({
+      label: 'Repository',
+      value: repositoryLabel
+    });
+  }
+
+  if (issueNumber !== undefined) {
+    rows.push({
+      label: 'GitHub issue',
+      value: `#${issueNumber}`
+    });
+  }
+
+  if (phaseLabel) {
+    rows.push({
+      label: 'Failed while',
+      value: phaseLabel
+    });
+  }
+
+  if (rateLimitResourceLabel) {
+    rows.push({
+      label: 'GitHub bucket',
+      value: rateLimitResourceLabel
+    });
+  }
+
+  if (rateLimitResetAt) {
+    rows.push({
+      label: 'Paused until',
+      value: formatDate(rateLimitResetAt, rateLimitResetAt)
+    });
+  }
+
+  const rawMessage =
+    syncState.errorDetails?.rawMessage && syncState.errorDetails.rawMessage !== syncState.message
+      ? syncState.errorDetails.rawMessage
+      : undefined;
+  const suggestedAction = syncState.errorDetails?.suggestedAction;
+
+  if (rows.length === 0 && !rawMessage && !suggestedAction) {
+    return null;
+  }
+
+  return {
+    rows,
+    ...(rawMessage ? { rawMessage } : {}),
+    ...(suggestedAction ? { suggestedAction } : {})
+  };
+}
+
+function SyncProgressPanel(props: {
+  syncState: SyncRunState;
+  compact?: boolean;
+}): React.JSX.Element | null {
+  const progress = getRunningSyncProgressModel(props.syncState);
+  const progressValueText = progress?.issueProgressLabel ?? progress?.description;
+
+  if (!progress) {
+    return null;
+  }
+
+  const progressFillWidth =
+    progress.indeterminate || progress.percent === null
+      ? undefined
+      : `${progress.percent > 0 ? Math.max(progress.percent, 3) : 0}%`;
+
+  return (
+    <section
+      className={`ghsync-progress${props.compact ? ' ghsync-progress--compact' : ''}`}
+      aria-live="polite"
+    >
+      <div className="ghsync-progress__header">
+        <div className="ghsync-progress__copy">
+          <strong>{progress.title}</strong>
+          <span>{progress.description}</span>
+        </div>
+        {progress.repositoryPosition ? <span className="ghsync-progress__pill">{progress.repositoryPosition}</span> : null}
+      </div>
+
+      <div
+        className="ghsync-progress__track"
+        role="progressbar"
+        aria-label={progress.title}
+        aria-valuemin={0}
+        aria-valuemax={progress.totalIssueCount}
+        aria-valuenow={progress.indeterminate ? undefined : progress.completedIssueCount}
+        aria-valuetext={progressValueText}
+      >
+        <div
+          className={`ghsync-progress__fill${progress.indeterminate ? ' ghsync-progress__fill--indeterminate' : ''}`}
+          style={progressFillWidth ? { width: progressFillWidth } : undefined}
+        />
+      </div>
+
+      <div className="ghsync-progress__meta">
+        <span>{progress.issueProgressLabel ?? 'Calculating the total number of issues to sync.'}</span>
+        <span>{progress.currentIssueLabel ?? progress.repositoryLabel ?? 'GitHub sync is running.'}</span>
+      </div>
+    </section>
+  );
+}
+
+function SyncDiagnosticsPanel(props: {
+  syncState: SyncRunState;
+  requestError?: string | null;
+  compact?: boolean;
+}): React.JSX.Element | null {
+  const diagnostics = getSyncDiagnostics(props.syncState);
+  const requestError = props.requestError?.trim() ? props.requestError.trim() : null;
+
+  if (!diagnostics && !requestError) {
+    return null;
+  }
+
+  return (
+    <section className={`ghsync-diagnostics${props.compact ? ' ghsync-diagnostics--compact' : ''}`}>
+      <div className="ghsync-diagnostics__header">
+        <strong>{diagnostics ? 'Troubleshooting details' : 'Sync request failed'}</strong>
+        <span>
+          {diagnostics
+            ? 'GitHub Sync saved this snapshot from the latest failed run.'
+            : 'The sync request failed before the worker returned a saved result.'}
+        </span>
+      </div>
+
+      {requestError ? (
+        <div className="ghsync-diagnostics__block">
+          <span className="ghsync-diagnostics__label">Request error</span>
+          <div className="ghsync-diagnostics__value ghsync-diagnostics__value--code">{requestError}</div>
+        </div>
+      ) : null}
+
+      {diagnostics?.rows.length ? (
+        <div className="ghsync-diagnostics__grid">
+          {diagnostics.rows.map((row) => (
+            <div key={row.label} className="ghsync-diagnostics__item">
+              <span className="ghsync-diagnostics__label">{row.label}</span>
+              <strong className="ghsync-diagnostics__value">{row.value}</strong>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      {diagnostics?.rawMessage ? (
+        <div className="ghsync-diagnostics__block">
+          <span className="ghsync-diagnostics__label">Raw error</span>
+          <div className="ghsync-diagnostics__value ghsync-diagnostics__value--code">{diagnostics.rawMessage}</div>
+        </div>
+      ) : null}
+
+      {diagnostics?.suggestedAction ? (
+        <div className="ghsync-diagnostics__block">
+          <span className="ghsync-diagnostics__label">Next step</span>
+          <div className="ghsync-diagnostics__value">{diagnostics.suggestedAction}</div>
+        </div>
+      ) : null}
+    </section>
+  );
 }
 
 export function GitHubSyncSettingsPage(): React.JSX.Element {
@@ -1434,13 +2312,24 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
   const [submittingToken, setSubmittingToken] = useState(false);
   const [submittingSetup, setSubmittingSetup] = useState(false);
   const [runningSync, setRunningSync] = useState(false);
+  const [manualSyncRequestError, setManualSyncRequestError] = useState<string | null>(null);
   const [scheduleFrequencyDraft, setScheduleFrequencyDraft] = useState(String(DEFAULT_SCHEDULE_FREQUENCY_MINUTES));
   const [tokenStatusOverride, setTokenStatusOverride] = useState<TokenStatus | null>(null);
   const [validatedLogin, setValidatedLogin] = useState<string | null>(null);
   const [tokenDraft, setTokenDraft] = useState('');
   const [showSavedTokenHint, setShowSavedTokenHint] = useState(false);
   const [showTokenEditor, setShowTokenEditor] = useState(false);
+  const [cachedSettings, setCachedSettings] = useState<GitHubSyncSettings | null>(null);
   const themeMode = useResolvedThemeMode();
+
+  const currentSettings = settings.data ?? cachedSettings;
+  const showInitialLoadingState = settings.loading && !settings.data && !cachedSettings;
+
+  useEffect(() => {
+    if (settings.data) {
+      setCachedSettings(settings.data);
+    }
+  }, [settings.data]);
 
   useEffect(() => {
     if (!settings.data) {
@@ -1454,6 +2343,7 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
       scheduleFrequencyMinutes: nextScheduleFrequencyMinutes,
       paperclipApiBaseUrl: settings.data.paperclipApiBaseUrl,
       githubTokenConfigured: settings.data.githubTokenConfigured,
+      totalSyncedIssuesCount: settings.data.totalSyncedIssuesCount,
       updatedAt: settings.data.updatedAt
     });
     setScheduleFrequencyDraft(String(nextScheduleFrequencyMinutes));
@@ -1479,8 +2369,32 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
     setForm((current) => ({
       ...current,
       mappings: [createEmptyMapping(0)]
-    }));
+      }));
   }, [form.githubTokenConfigured, form.mappings.length, showSavedTokenHint, tokenStatusOverride]);
+
+  useEffect(() => {
+    if (form.syncState.status !== 'running') {
+      return;
+    }
+
+    const refreshSettings = () => {
+      try {
+        settings.refresh();
+      } catch {
+        return;
+      }
+    };
+
+    const intervalId = globalThis.setInterval(() => {
+      refreshSettings();
+    }, SYNC_POLL_INTERVAL_MS);
+
+    refreshSettings();
+
+    return () => {
+      globalThis.clearInterval(intervalId);
+    };
+  }, [form.syncState.status, settings.refresh]);
 
   const theme = themeMode === 'light' ? LIGHT_PALETTE : DARK_PALETTE;
   const themeVars = buildThemeVars(theme, themeMode);
@@ -1496,29 +2410,62 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
           ? 'Add a token to continue.'
           : null;
   const repositoriesUnlocked = tokenStatus === 'valid';
-  const savedMappingsSource = settings.data ? settings.data.mappings ?? [] : form.mappings;
+  const savedMappingsSource = currentSettings ? currentSettings.mappings ?? [] : form.mappings;
   const savedMappings = getComparableMappings(savedMappingsSource);
   const draftMappings = getComparableMappings(form.mappings);
   const savedMappingCount = savedMappings.length;
   const syncUnlocked = tokenStatus === 'valid' && savedMappingCount > 0;
+  const displaySyncState = getDisplaySyncState(form.syncState, {
+    hasToken: tokenStatus === 'valid',
+    hasMappings: savedMappingCount > 0
+  });
   const mappingsDirty = JSON.stringify(draftMappings) !== JSON.stringify(savedMappings);
   const scheduleFrequencyError = getScheduleFrequencyError(scheduleFrequencyDraft);
   const scheduleFrequencyMinutes = parseScheduleFrequencyDraft(scheduleFrequencyDraft) ?? form.scheduleFrequencyMinutes;
-  const savedScheduleFrequencyMinutes = normalizeScheduleFrequencyMinutes(settings.data?.scheduleFrequencyMinutes);
+  const savedScheduleFrequencyMinutes = normalizeScheduleFrequencyMinutes(currentSettings?.scheduleFrequencyMinutes);
   const scheduleDirty = scheduleFrequencyError === null && scheduleFrequencyMinutes !== savedScheduleFrequencyMinutes;
   const mappings = form.mappings.length > 0 ? form.mappings : [createEmptyMapping(0)];
-  const syncStatus = getSyncStatus(form.syncState, runningSync, syncUnlocked);
-  const canSaveToken = !submittingToken && !settings.loading && tokenDraft.trim().length > 0;
+  const syncInFlight = runningSync || displaySyncState.status === 'running';
+  const settingsMutationsLocked = syncInFlight;
+  const settingsMutationsLockReason = settingsMutationsLocked
+    ? 'Settings are temporarily locked while a sync is running to avoid overwriting local edits.'
+    : null;
+  const syncStatus = getSyncStatus(displaySyncState, runningSync, syncUnlocked);
+  const canSaveToken =
+    !settingsMutationsLocked &&
+    !submittingToken &&
+    !showInitialLoadingState &&
+    tokenDraft.trim().length > 0;
   const canSaveSetup =
     repositoriesUnlocked &&
+    !settingsMutationsLocked &&
     !submittingSetup &&
-    !settings.loading &&
+    !showInitialLoadingState &&
     scheduleFrequencyError === null &&
     (mappingsDirty || scheduleDirty);
   const showTokenForm = tokenStatus !== 'valid' || showTokenEditor;
-  const lastUpdated = formatDate(form.updatedAt ?? settings.data?.updatedAt, 'Not saved yet');
-  const lastSync = formatDate(form.syncState.checkedAt, 'Never');
+  const lastUpdated = formatDate(form.updatedAt ?? currentSettings?.updatedAt, 'Not saved yet');
+  const lastSync = formatDate(displaySyncState.checkedAt, 'Never');
   const scheduleDescription = formatScheduleFrequency(scheduleFrequencyMinutes);
+  const syncProgress = getRunningSyncProgressModel(displaySyncState);
+  const syncMetricCards = getSyncMetricCards({
+    totalSyncedIssuesCount: currentSettings?.totalSyncedIssuesCount ?? form.totalSyncedIssuesCount,
+    erroredIssuesCount: displaySyncState.erroredIssuesCount,
+    syncState: displaySyncState,
+    savedMappingCount
+  });
+  const syncSummaryPrimaryText =
+    syncProgress?.title ??
+    displaySyncState.message ??
+    (syncUnlocked ? 'Ready to sync.' : tokenStatus === 'valid' ? 'Save a repository to enable sync.' : 'Add a valid token to enable sync.');
+  const syncSummarySecondaryText = syncProgress
+    ? [
+        syncProgress.issueProgressLabel,
+        syncProgress.currentIssueLabel ?? syncProgress.repositoryPosition,
+        `Auto-sync: ${scheduleDescription}`
+      ].filter((value): value is string => Boolean(value))
+        .join(' · ')
+    : `Auto-sync: ${scheduleDescription} · Last trigger: ${displaySyncState.lastRunTrigger ?? 'none'} · Last checked: ${displaySyncState.checkedAt ? formatDate(displaySyncState.checkedAt) : 'never'}`;
   const syncSummaryClass =
     syncStatus.tone === 'success'
       ? 'ghsync__sync-summary ghsync__sync-summary--success'
@@ -1541,7 +2488,26 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
 
       return {
         ...current,
-        mappings: nextMappings.map((mapping) => (mapping.id === mappingId ? { ...mapping, [field]: value } : mapping))
+        mappings: nextMappings.map((mapping) => {
+          if (mapping.id !== mappingId) {
+            return mapping;
+          }
+
+          if (field === 'repositoryUrl') {
+            return {
+              ...mapping,
+              repositoryUrl: value,
+              ...(shouldAutofillProjectName(mapping)
+                ? { paperclipProjectName: formatProjectNameFromRepository(value) }
+                : {})
+            };
+          }
+
+          return {
+            ...mapping,
+            [field]: value
+          };
+        })
       };
     });
   }
@@ -1741,23 +2707,27 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
 
   async function handleRunSyncNow() {
     setRunningSync(true);
+    setManualSyncRequestError(null);
 
     try {
       if (!syncUnlocked) {
         throw new Error('Save at least one repository before running sync.');
       }
 
-      const result = await runSyncNow({}) as GitHubSyncSettings;
+      const result = await runSyncNow({
+        paperclipApiBaseUrl: getPaperclipApiBaseUrl()
+      }) as GitHubSyncSettings;
 
       setForm((current) => ({
         ...current,
         syncState: result.syncState
       }));
+      setManualSyncRequestError(null);
 
       toast({
-        title: result.syncState.status === 'error' ? 'GitHub sync needs attention' : 'GitHub sync finished',
-        body: result.syncState.message ?? 'GitHub sync completed.',
-        tone: result.syncState.status === 'error' ? 'error' : 'success'
+        title: getSyncToastTitle(result.syncState),
+        body: getSyncToastBody(result.syncState),
+        tone: getSyncToastTone(result.syncState)
       });
 
       try {
@@ -1766,11 +2736,19 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
         return;
       }
     } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to run sync.';
+      setManualSyncRequestError(message);
       toast({
         title: 'Unable to run GitHub sync',
-        body: error instanceof Error ? error.message : 'Unable to run sync.',
+        body: message,
         tone: 'error'
       });
+
+      try {
+        await settings.refresh();
+      } catch {
+        return;
+      }
     } finally {
       setRunningSync(false);
     }
@@ -1784,6 +2762,7 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
         <div className="ghsync__header-copy">
           <h2>GitHub Sync settings</h2>
           <p>Add a token to get started.</p>
+          {settingsMutationsLockReason ? <p className="ghsync__hint">{settingsMutationsLockReason}</p> : null}
         </div>
         <span className={`ghsync__badge ${getToneClass(tokenTone)}`}>
           <span className="ghsync__badge-dot" aria-hidden="true" />
@@ -1797,7 +2776,7 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
             <h3>Connect GitHub</h3>
           </div>
 
-          {settings.loading ? <p className="ghsync__loading">Loading saved settings…</p> : null}
+          {showInitialLoadingState ? <p className="ghsync__loading">Loading saved settings…</p> : null}
 
           <section className="ghsync__section">
             <div className="ghsync__section-head">
@@ -1819,6 +2798,7 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
                     className="ghsync__input"
                     type="password"
                     value={tokenDraft}
+                    disabled={settingsMutationsLocked}
                     onChange={(event) => {
                       setTokenDraft(event.currentTarget.value);
                       setTokenStatusOverride(hasSavedToken ? 'valid' : null);
@@ -1834,6 +2814,7 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
                       <button
                         type="button"
                         className="ghsync__button ghsync__button--secondary"
+                        disabled={settingsMutationsLocked}
                         onClick={() => {
                           setShowTokenEditor(false);
                           setTokenDraft('');
@@ -1862,6 +2843,7 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
                 <button
                   type="button"
                   className="ghsync__button ghsync__button--secondary"
+                  disabled={settingsMutationsLocked}
                   onClick={() => {
                     setShowTokenEditor(true);
                     setTokenDraft('');
@@ -1894,6 +2876,7 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
               </div>
             ) : (
               <div className="ghsync__stack">
+                {settingsMutationsLockReason ? <p className="ghsync__hint">{settingsMutationsLockReason}</p> : null}
                 <div className="ghsync__mapping-list">
                   {mappings.map((mapping, index) => {
                     const canRemove = mappings.length > 1 || mapping.repositoryUrl.trim() !== '' || mapping.paperclipProjectName.trim() !== '';
@@ -1908,6 +2891,7 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
                             <button
                               type="button"
                               className="ghsync__button ghsync__button--danger"
+                              disabled={settingsMutationsLocked}
                               onClick={() => removeMapping(mapping.id)}
                             >
                               Remove
@@ -1923,6 +2907,7 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
                               className="ghsync__input"
                               type="text"
                               value={mapping.repositoryUrl}
+                              disabled={settingsMutationsLocked}
                               onChange={(event) => updateMapping(mapping.id, 'repositoryUrl', event.currentTarget.value)}
                               placeholder="owner/repository or https://github.com/owner/repository"
                               autoComplete="off"
@@ -1936,8 +2921,8 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
                               className="ghsync__input"
                               type="text"
                               value={mapping.paperclipProjectName}
+                              disabled={settingsMutationsLocked}
                               onChange={(event) => updateMapping(mapping.id, 'paperclipProjectName', event.currentTarget.value)}
-                              placeholder="Engineering"
                               autoComplete="off"
                               readOnly={Boolean(mapping.paperclipProjectId)}
                             />
@@ -1953,6 +2938,7 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
                     <button
                       type="button"
                       className="ghsync__button ghsync__button--secondary"
+                      disabled={settingsMutationsLocked}
                       onClick={addMapping}
                     >
                       Add another repository
@@ -1992,6 +2978,7 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
                       min={1}
                       step={1}
                       value={scheduleFrequencyDraft}
+                      disabled={settingsMutationsLocked}
                       onChange={(event) => {
                         setScheduleFrequencyDraft(event.currentTarget.value);
                       }}
@@ -2018,42 +3005,41 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
                 ) : (
                   <>
                     <div className="ghsync__stats">
-                      <div className="ghsync__stat">
-                        <span>Checked</span>
-                        <strong>{form.syncState.syncedIssuesCount ?? 0}</strong>
-                      </div>
-                      <div className="ghsync__stat">
-                        <span>Created</span>
-                        <strong>{form.syncState.createdIssuesCount ?? 0}</strong>
-                      </div>
-                      <div className="ghsync__stat">
-                        <span>Skipped</span>
-                        <strong>{form.syncState.skippedIssuesCount ?? 0}</strong>
-                      </div>
+                      {syncMetricCards.map((metric) => (
+                        <div
+                          key={metric.key}
+                          className={`ghsync__stat${metric.emphasized ? ' ghsync__stat--emphasized' : ''}`}
+                        >
+                          <strong>{metric.value}</strong>
+                          <span>{metric.label}</span>
+                          <p>{metric.description}</p>
+                        </div>
+                      ))}
                     </div>
+
+                    <SyncProgressPanel syncState={displaySyncState} />
 
                     <div className={syncSummaryClass}>
                       <div>
-                        <strong>{form.syncState.message ?? 'Ready to sync.'}</strong>
-                        <span>
-                          Auto-sync: {scheduleDescription}
-                          {' · '}
-                          Last trigger: {form.syncState.lastRunTrigger ?? 'none'}
-                          {' · '}
-                          Last checked: {form.syncState.checkedAt ? formatDate(form.syncState.checkedAt) : 'never'}
-                        </span>
+                        <strong>{syncSummaryPrimaryText}</strong>
+                        <span>{syncSummarySecondaryText}</span>
                       </div>
                       <button
                         type="button"
                         className="ghsync__button ghsync__button--primary"
                         onClick={handleRunSyncNow}
-                        disabled={runningSync || settings.loading}
+                        disabled={syncInFlight || showInitialLoadingState}
                       >
-                        {runningSync ? 'Running…' : 'Run sync now'}
+                        {syncInFlight ? 'Running…' : 'Run sync now'}
                       </button>
                     </div>
                   </>
                 )}
+
+                <SyncDiagnosticsPanel
+                  syncState={displaySyncState}
+                  requestError={manualSyncRequestError}
+                />
 
                 <div className="ghsync__section-footer">
                   <div className="ghsync__button-row">
@@ -2132,23 +3118,41 @@ export function GitHubSyncDashboardWidget(): React.JSX.Element {
   const settings = usePluginData<GitHubSyncSettings>('settings.registration', {});
   const runSyncNow = usePluginAction('sync.runNow');
   const [runningSync, setRunningSync] = useState(false);
+  const [manualSyncRequestError, setManualSyncRequestError] = useState<string | null>(null);
   const [settingsHref, setSettingsHref] = useState(SETTINGS_INDEX_HREF);
+  const [cachedSettings, setCachedSettings] = useState<GitHubSyncSettings | null>(null);
   const themeMode = useResolvedThemeMode();
 
   const theme = themeMode === 'light' ? LIGHT_PALETTE : DARK_PALETTE;
   const themeVars = buildThemeVars(theme, themeMode);
-  const current = settings.data ?? EMPTY_SETTINGS;
+  const current = settings.data ?? cachedSettings ?? EMPTY_SETTINGS;
+  const showInitialLoadingState = settings.loading && !settings.data && !cachedSettings;
   const syncState = current.syncState ?? EMPTY_SETTINGS.syncState;
   const tokenValid = Boolean(current.githubTokenConfigured);
   const savedMappingCount = getComparableMappings(current.mappings ?? []).length;
+  const displaySyncState = getDisplaySyncState(syncState, {
+    hasToken: tokenValid,
+    hasMappings: savedMappingCount > 0
+  });
   const syncUnlocked = tokenValid && savedMappingCount > 0;
+  const syncInFlight = runningSync || displaySyncState.status === 'running';
   const scheduleFrequencyMinutes = normalizeScheduleFrequencyMinutes(current.scheduleFrequencyMinutes);
   const scheduleDescription = formatScheduleFrequency(scheduleFrequencyMinutes);
-  const summary = getDashboardSummary(tokenValid, savedMappingCount, syncState, runningSync, scheduleFrequencyMinutes);
-  const lastSync = formatDate(syncState.checkedAt, 'Never');
-  const syncedIssuesCount = syncState.syncedIssuesCount ?? 0;
-  const createdIssuesCount = syncState.createdIssuesCount ?? 0;
-  const skippedIssuesCount = syncState.skippedIssuesCount ?? 0;
+  const summary = getDashboardSummary(tokenValid, savedMappingCount, displaySyncState, runningSync, scheduleFrequencyMinutes);
+  const syncProgress = getRunningSyncProgressModel(displaySyncState);
+  const syncMetricCards = getSyncMetricCards({
+    totalSyncedIssuesCount: current.totalSyncedIssuesCount,
+    erroredIssuesCount: displaySyncState.erroredIssuesCount,
+    syncState: displaySyncState,
+    savedMappingCount
+  });
+  const lastSync = formatDate(displaySyncState.checkedAt, 'Never');
+
+  useEffect(() => {
+    if (settings.data) {
+      setCachedSettings(settings.data);
+    }
+  }, [settings.data]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2173,27 +3177,62 @@ export function GitHubSyncDashboardWidget(): React.JSX.Element {
     };
   }, []);
 
+  useEffect(() => {
+    if (displaySyncState.status !== 'running') {
+      return;
+    }
+
+    const refreshSettings = () => {
+      try {
+        settings.refresh();
+      } catch {
+        return;
+      }
+    };
+
+    const intervalId = globalThis.setInterval(() => {
+      refreshSettings();
+    }, SYNC_POLL_INTERVAL_MS);
+
+    refreshSettings();
+
+    return () => {
+      globalThis.clearInterval(intervalId);
+    };
+  }, [displaySyncState.status, settings.refresh]);
+
   async function handleRunSync(): Promise<void> {
     setRunningSync(true);
+    setManualSyncRequestError(null);
 
     try {
-      const result = await runSyncNow({}) as GitHubSyncSettings;
+      const result = await runSyncNow({
+        paperclipApiBaseUrl: getPaperclipApiBaseUrl()
+      }) as GitHubSyncSettings;
       const nextSyncState = result.syncState ?? EMPTY_SETTINGS.syncState;
+      setManualSyncRequestError(null);
 
       toast({
-        title: nextSyncState.status === 'error' ? 'GitHub sync needs attention' : 'GitHub sync started',
-        body: nextSyncState.message ?? 'GitHub sync completed.',
-        tone: nextSyncState.status === 'error' ? 'error' : 'success'
+        title: getSyncToastTitle(nextSyncState),
+        body: getSyncToastBody(nextSyncState),
+        tone: getSyncToastTone(nextSyncState)
       });
 
       await settings.refresh();
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to run GitHub sync.';
+      setManualSyncRequestError(message);
       toast({
         title: 'Unable to run GitHub sync',
         body: message,
         tone: 'error'
       });
+
+      try {
+        await settings.refresh();
+      } catch {
+        return;
+      }
     } finally {
       setRunningSync(false);
     }
@@ -2226,34 +3265,57 @@ export function GitHubSyncDashboardWidget(): React.JSX.Element {
         {settings.error ? <div className="ghsync-widget__message">{settings.error.message}</div> : null}
 
         <div className="ghsync-widget__stats">
-          <div className="ghsync-widget__stat">
-            <span>Checked</span>
-            <strong>{syncedIssuesCount}</strong>
-          </div>
-          <div className="ghsync-widget__stat">
-            <span>Imported</span>
-            <strong>{createdIssuesCount}</strong>
-          </div>
-          <div className="ghsync-widget__stat">
-            <span>Skipped</span>
-            <strong>{skippedIssuesCount}</strong>
-          </div>
+          {syncMetricCards.map((metric) => (
+            <div
+              key={metric.key}
+              className={`ghsync-widget__stat${metric.emphasized ? ' ghsync-widget__stat--emphasized' : ''}`}
+            >
+              <strong>{metric.value}</strong>
+              <span>{metric.label}</span>
+              <p>{metric.description}</p>
+            </div>
+          ))}
         </div>
 
+        <SyncProgressPanel
+          syncState={displaySyncState}
+          compact
+        />
+
         <div className="ghsync-widget__summary">
-          <strong>{settings.loading ? 'Loading sync status…' : syncUnlocked ? 'Latest result' : 'Next step'}</strong>
+          <strong>
+            {showInitialLoadingState
+              ? 'Loading sync status…'
+              : syncInFlight
+                ? 'Live run'
+                : syncUnlocked
+                  ? 'Latest result'
+                  : 'Next step'}
+          </strong>
           <span>
-            {settings.loading
+            {showInitialLoadingState
               ? 'Fetching the latest GitHub sync state from the worker.'
+              : syncProgress
+                ? [
+                    syncProgress.issueProgressLabel,
+                    syncProgress.currentIssueLabel ?? syncProgress.repositoryPosition
+                  ].filter((value): value is string => Boolean(value))
+                    .join(' · ')
               : !tokenValid
                 ? 'Open settings to validate GitHub access.'
                 : savedMappingCount === 0
                   ? 'Open settings and add a repository. The Paperclip project will be created if it does not exist.'
-                  : syncState.checkedAt
+                  : displaySyncState.checkedAt
                     ? `Last checked ${lastSync}.`
                     : 'Everything is configured. Run the first sync when you are ready.'}
           </span>
         </div>
+
+        <SyncDiagnosticsPanel
+          syncState={displaySyncState}
+          requestError={manualSyncRequestError}
+          compact
+        />
 
         <div className="ghsync-widget__actions">
           <div className="ghsync-widget__button-row">
@@ -2268,9 +3330,9 @@ export function GitHubSyncDashboardWidget(): React.JSX.Element {
                 type="button"
                 className="ghsync__button ghsync__button--primary"
                 onClick={handleRunSync}
-                disabled={runningSync || settings.loading}
+                disabled={syncInFlight || showInitialLoadingState}
               >
-                {runningSync ? 'Running…' : 'Run sync now'}
+                {syncInFlight ? 'Running…' : 'Run sync now'}
               </button>
             ) : null}
           </div>
