@@ -4,90 +4,87 @@ Guidance for agents working in this repository.
 
 ## Repository intent
 
-This repo is a multi-plugin workspace for Paperclip plugins. Treat the root as shared infrastructure and documentation, and treat each directory under `plugins/` as an isolated plugin package.
+This repo contains a single Paperclip plugin package for GitHub synchronization workflows. Treat the repository root as the package root.
 
-## Workspace layout
+## Package layout
 
 ```text
 .
-├── AGENTS.md
-├── docs/
-│   └── PLUGIN_WORKSPACE.md
-├── plugins/
-│   ├── .gitkeep
-│   └── <plugin-package>/
+├── .github/workflows/
 ├── scripts/
-│   └── create-plugin.mjs
+│   ├── e2e/
+│   └── noop.mjs
+├── src/
+│   ├── manifest.ts
+│   ├── worker.ts
+│   └── ui/
+│       └── index.tsx
+├── tests/
+│   └── plugin.spec.ts
+├── SPEC.md
+├── README.md
 ├── package.json
-└── pnpm-workspace.yaml
+└── tsconfig.json
 ```
 
-## Where to put things
+## Source-of-truth files
 
-- New plugins belong in `plugins/<package-name>/`.
-- Root-level changes should be limited to workspace-wide tooling, shared docs, and automation scripts.
-- Plugin-specific code, tests, assets, and package configuration should stay inside the relevant plugin directory.
+Read these before changing behavior:
 
-## Preferred workflow
+- `SPEC.md` - plugin requirements that must remain true
+- `README.md` - package purpose and current workflow
+- `src/manifest.ts` - plugin registration, capabilities, and UI slot metadata
+- `src/worker.ts` - worker logic, sync behavior, and persisted plugin state
+- `src/ui/index.tsx` - in-host Paperclip UI surfaces
+- `tests/plugin.spec.ts` - minimum fast contract coverage
 
-### Adding a plugin
+## Working rules
 
-Use the root helper when the Paperclip scaffold CLI is available:
+### Manifest changes
+
+- Keep the plugin id stable unless the task explicitly requires a breaking rename.
+- Keep manifest entrypoints aligned with the build output in `dist/`.
+- Do not add capabilities casually; every capability should correspond to real behavior.
+
+### Worker changes
+
+- Match the existing `definePlugin(...)/runWorker(...)` pattern.
+- Prefer explicit state keys and action/data registrations.
+- Keep persisted state keys stable unless migration work is part of the task.
+
+### UI changes
+
+- Treat `src/ui/index.tsx` as a real Paperclip-hosted UI, not a standalone demo.
+- Keep loading, error, and empty states resilient.
+- If you rename exported UI components, update the manifest slot export names in the same change.
+
+### Packaging and release changes
+
+- Keep package-specific dependencies in the root `package.json`.
+- Do not edit `dist/` by hand; rebuild through the package scripts.
+- Keep GitHub Actions workflows focused on CI and publish automation for this package.
+
+## Verification
+
+Run the smallest relevant scope first from the repository root:
 
 ```bash
-pnpm plugin:create @your-scope/your-plugin-name
-```
-
-The helper expects the Paperclip scaffold entrypoint at:
-
-```text
-vendor/paperclip/packages/plugins/create-paperclip-plugin/dist/index.js
-```
-
-If that scaffold is missing, do not invent a custom plugin structure unless the task explicitly asks for it. Prefer setting up the expected scaffold source first.
-
-### Working on a plugin
-
-From the repository root, prefer workspace commands:
-
-```bash
-pnpm build
-pnpm test
 pnpm typecheck
-pnpm lint
+pnpm test
+pnpm build
 ```
 
-For targeted work, use pnpm filters against the plugin package name when a plugin exists.
+Use these selectively:
 
-## Plugin expectations
+- `pnpm test` for code changes in `src/` or `tests/`
+- `pnpm test:e2e` when touching manifest contributions, UI mount behavior, plugin installation flow, or the e2e harness
+- `pnpm verify:manual` when the task benefits from visual inspection inside a real Paperclip host
 
-A typical plugin package should contain at least:
+## Documentation expectations
 
-- `src/manifest.ts`
-- `src/worker.ts`
-- `src/ui/index.tsx`
-- `tests/`
-- `package.json`
+Update `README.md` and `SPEC.md` when any of these change:
 
-Match the current Paperclip plugin runtime rather than future-facing spec ideas. Keep plugin UI self-contained and avoid assuming host-provided shared UI components unless the repo explicitly adds them.
-
-## Root guardrails
-
-- Do not turn the root into a plugin package.
-- Do not mix multiple plugins into the same folder.
-- Do not add repo-wide dependencies unless they are truly shared workspace tooling.
-- Do not hardcode environment-specific absolute paths in committed files.
-- Keep the root scaffold lightweight; prefer per-plugin dependencies and scripts.
-
-## Documentation and verification
-
-When you change workspace structure or developer workflow, update `README.md` and `docs/PLUGIN_WORKSPACE.md` if needed.
-
-After making changes, verify the smallest relevant scope first:
-
-- `lsp_diagnostics` or equivalent on edited files
-- `pnpm typecheck`
-- `pnpm test`
-- `pnpm build`
-
-If the workspace is still empty, it is acceptable for root recursive commands to report that no projects matched.
+- plugin purpose or scope
+- manifest capabilities or slots
+- worker or UI contract
+- packaging or release workflow

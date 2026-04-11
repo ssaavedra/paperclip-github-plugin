@@ -1,14 +1,49 @@
 {
-  "name": "paperclip-plugins",
-  "private": true,
-  "version": "0.0.0",
+  "name": "paperclip-github",
+  "version": "0.1.2",
+  "description": "Paperclip plugin for synchronizing GitHub issues into Paperclip projects.",
+  "type": "module",
   "packageManager": "pnpm@10.17.1",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alvarosanchez/paperclip-github.git"
+  },
+  "homepage": "https://github.com/alvarosanchez/paperclip-github#readme",
+  "bugs": {
+    "url": "https://github.com/alvarosanchez/paperclip-github/issues"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js",
+    "ui": "./dist/ui/"
+  },
   "scripts": {
-    "build": "pnpm -r --if-present build",
-    "dev": "pnpm -r --parallel --if-present dev",
-    "lint": "pnpm -r --if-present lint",
-    "test": "pnpm -r --if-present test",
-    "typecheck": "pnpm -r --if-present typecheck",
-    "plugin:create": "node ./scripts/create-plugin.mjs"
+    "build": "node ./scripts/build.mjs",
+    "prepack": "pnpm build",
+    "lint": "node ./scripts/noop.mjs lint",
+    "test": "node --experimental-strip-types --test tests/plugin.spec.ts",
+    "test:e2e": "pnpm build && pnpm exec playwright install chromium && node ./scripts/e2e/run-paperclip-smoke.mjs",
+    "typecheck": "tsc --noEmit",
+    "verify:manual": "pnpm build && pnpm exec playwright install chromium && node ./scripts/e2e/manual-paperclip-verify.mjs"
+  },
+  "dependencies": {
+    "@octokit/rest": "^22.0.0",
+    "@paperclipai/plugin-sdk": "^2026.403.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "esbuild": "^0.25.3",
+    "playwright": "^1.58.0",
+    "typescript": "^5.9.2"
   }
 }

@@ -1,5 +1,4 @@
 node_modules
-pnpm-lock.yaml
 .DS_Store
 
 dist
@@ -11,12 +10,7 @@ coverage
 .env.*
 
 .playwright-cli/
-plugins/*/mockups/
-plugins/*/tests/e2e/results/
-
-plugins/*/.paperclip-sdk
-plugins/*/dist
-plugins/*/build
-plugins/*/coverage
+tests/e2e/results/
+.paperclip-sdk
 
 .idea/
