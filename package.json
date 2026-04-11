@@ -33,7 +33,7 @@
     "build": "node ./scripts/build.mjs",
     "prepack": "pnpm build",
     "lint": "node ./scripts/noop.mjs lint",
-    "test": "node --experimental-strip-types --test tests/plugin.spec.ts",
+    "test": "tsx --test tests/plugin.spec.ts",
     "test:e2e": "pnpm build && pnpm exec playwright install chromium && node ./scripts/e2e/run-paperclip-smoke.mjs",
     "typecheck": "tsc --noEmit",
     "verify:manual": "pnpm build && pnpm exec playwright install chromium && node ./scripts/e2e/manual-paperclip-verify.mjs"
@@ -48,6 +48,7 @@
     "@types/react": "^19.2.2",
     "esbuild": "^0.25.3",
     "playwright": "^1.58.0",
+    "tsx": "^4.20.6",
     "typescript": "^5.9.2"
   }
 }
