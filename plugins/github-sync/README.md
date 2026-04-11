@@ -33,7 +33,7 @@ This package now includes:
 - `pnpm build` — bundles `src/manifest.ts`, `src/worker.ts`, and `src/ui/index.tsx` into `dist/`.
 - `pnpm test` — runs the package-level Node tests.
 - `pnpm test:e2e` — builds the plugin, installs Playwright Chromium if needed, boots an isolated Paperclip instance, installs this plugin, opens the real settings page, and verifies the settings UI renders.
-- `pnpm verify:manual` — builds the plugin, boots the same disposable Paperclip instance, and opens the plugin settings page in your default browser for manual inspection.
+- `pnpm verify:manual` — builds the plugin, boots a Paperclip instance for manual inspection, and opens the plugin settings page in your default browser. By default the instance is disposable; set `PAPERCLIP_E2E_STATE_DIR` to reuse a local state directory across runs.
 - `pnpm typecheck` — runs TypeScript without emitting files.
 
 ## Current package layout
@@ -45,8 +45,16 @@ This package now includes:
 - `tests/plugin.spec.ts` - package-level tests
 - `scripts/build.mjs` - package build script powered by esbuild
 - `scripts/e2e/run-paperclip-smoke.mjs` - reusable headless Paperclip + Playwright end-to-end harness
-- `scripts/e2e/manual-paperclip-verify.mjs` - disposable manual inspection harness
+- `scripts/e2e/manual-paperclip-verify.mjs` - manual inspection harness with optional persistent local state
 
 ## Notes
 
 The package now has a real build step so `dist/` stays aligned with `src/` before manual verification or plugin installation. The dashboard widget surfaces the current blocker or readiness state and links back to plugin setup. Saving a token validates it against the GitHub API, creates or reuses a company secret, and stores only the returned secret UUID in plugin config. Saving setup now persists both repository mappings, the selected automatic sync cadence, and the current Paperclip host origin so scheduled syncs can call the local Paperclip label API. Scheduled job ticks happen every minute, and the worker skips runs until the saved cadence is actually due. Saving a mapping creates or reuses the target Paperclip project and binds the GitHub repository URL to the project workspace. Manual sync requests from settings, the global toolbar, or project/issue toolbar buttons return promptly with a persisted `running` state when the sync is long-lived, and the UI keeps polling until the worker writes the final success or failure result. Repeated sync runs keep a plugin-owned import registry plus per-issue GitHub link metadata so previously imported GitHub issues are skipped instead of being recreated while their Paperclip statuses and mapped label sets continue to reconcile against GitHub issue and linked-PR state. If the registry is stale or missing for a project, the worker still repairs it by reusing existing imported issues whose legacy description source link matches the GitHub issue URL. Imported issues keep the original GitHub title instead of adding a `[GitHub]` prefix, and their descriptions now stay focused on the normalized GitHub body rather than prepended source-link boilerplate. The linked GitHub issue, repository, labels, PRs, and sync timestamp now live in a dedicated issue detail tab instead. When GitHub labels match existing Paperclip labels, the worker reuses them and prefers exact color matches when available; if a matching Paperclip label does not exist and the local Paperclip label API is reachable, the worker creates it with the GitHub color before attaching it to the imported issue. Later GitHub label changes reapply the full mapped label set onto the already-imported Paperclip issue, including label removals. Open GitHub issues without linked PRs land in Paperclip backlog on import, and once an open synced issue is in `backlog` the plugin leaves it there until a human moves it, even if new comments arrive or linked PR CI/review state changes. Open issues that are already active still use linked PR CI/review state to drive `todo`/`in_progress`/`in_review`, and closed issues map to `done` or `cancelled`. Whenever the plugin changes a Paperclip issue status, it still prefers the local Paperclip issue update API so Paperclip records the standard status activity entry, but it now creates the explanatory Paperclip comment separately and adds a comment annotation that renders the GitHub issue or PR links below the comment. To conserve GitHub API calls and reduce rate-limit pressure, the worker imports every synced GitHub issue as a top-level Paperclip issue instead of recreating GitHub's nested issue relationships inside Paperclip.
+
+For repeated manual testing, prefer a dedicated local state directory instead of re-entering credentials every run. Example:
+
+```bash
+PAPERCLIP_E2E_STATE_DIR="$HOME/.paperclip-dev/github-sync-manual" pnpm verify:manual
+```
+
+That keeps the Paperclip test instance state on your machine, so the saved GitHub token secret reference and repository mappings are available on the next launch. This is safer than passing a GitHub token on the command line because the plugin still stores the credential through Paperclip's local encrypted secret provider, and nothing new needs to be committed to the repo.

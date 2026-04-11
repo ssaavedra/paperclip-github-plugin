@@ -9,7 +9,9 @@ import net from 'node:net';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, '..', '..');
-const stateRoot = await mkdtemp(join(tmpdir(), 'github-sync-manual-'));
+const persistentStateRootInput = process.env.PAPERCLIP_E2E_STATE_DIR?.trim();
+const persistentStateRoot = persistentStateRootInput ? resolve(pluginRoot, persistentStateRootInput) : null;
+const stateRoot = persistentStateRoot ?? await mkdtemp(join(tmpdir(), 'github-sync-manual-'));
 const paperclipHome = join(stateRoot, 'paperclip-home');
 const dataDir = join(stateRoot, 'paperclip-data');
 const instanceId = 'github-sync-manual';
@@ -142,6 +144,14 @@ async function fetchJson(url, init = {}) {
   }
 
   return body;
+}
+
+async function ensureStateRoot() {
+  if (!persistentStateRoot) {
+    return;
+  }
+
+  await mkdir(stateRoot, { recursive: true, mode: 0o700 });
 }
 
 async function ensureConfigFile(configPath) {
@@ -314,7 +324,9 @@ async function cleanup() {
     }
   }
 
-  await rm(stateRoot, { recursive: true, force: true });
+  if (!persistentStateRoot) {
+    await rm(stateRoot, { recursive: true, force: true });
+  }
 }
 
 async function main() {
@@ -335,11 +347,13 @@ async function main() {
     void cleanup().finally(() => shutdownResolver());
   });
 
-  log(`Working directory ${stateRoot}`);
+  await ensureStateRoot();
+  log(`${persistentStateRoot ? 'Persistent' : 'Disposable'} working directory ${stateRoot}`);
 
   serverPort = await findAvailablePort(requestedPort);
   embeddedDbPort = await findAvailablePort(requestedDbPort);
   const configPath = join(paperclipHome, 'instances', instanceId, 'config.json');
+  env.PAPERCLIP_CONFIG_PATH = configPath;
   await ensureConfigFile(configPath);
   baseUrl = await readConfiguredBaseUrl(configPath);
 
@@ -376,6 +390,11 @@ async function main() {
   console.log(`Company: ${company?.name ?? 'Dummy Company'}`);
   console.log(`State dir: ${stateRoot}`);
   console.log(`Logs dir: ${join(dataDir, 'logs')}`);
+  if (persistentStateRoot) {
+    console.log('State preservation: enabled via PAPERCLIP_E2E_STATE_DIR.');
+  } else {
+    console.log('State preservation: disabled; this disposable instance will be deleted on exit.');
+  }
   console.log('The URL has been opened in your default browser.');
   console.log('Press Ctrl+C when you are done inspecting the instance.');
   console.log('');
