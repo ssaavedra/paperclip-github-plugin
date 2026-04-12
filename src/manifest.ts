@@ -10,7 +10,7 @@ export const manifest: PaperclipPluginManifestV1 = {
   displayName: 'GitHub Sync',
   description: 'Synchronize GitHub issues into Paperclip projects.',
   author: 'Álvaro Sánchez-Mariscal',
-  categories: ['workspace'],
+  categories: ['connector', 'ui'],
   capabilities: [
     'ui.page.register',
     DASHBOARD_WIDGET_CAPABILITY,
