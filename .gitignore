@@ -8,6 +8,7 @@ coverage
 
 .env
 .env.*
+.paperclip/
 
 .playwright-cli/
 tests/e2e/results/
