@@ -1487,13 +1487,13 @@ ${SHARED_PROGRESS_STYLES}
 `;
 
 const EXTENSION_SURFACE_STYLES = `
-  button[role="tab"][id$="trigger-plugin:github-sync:github-sync-issue-detail-tab"],
-  button[role="tab"][aria-controls$="content-plugin:github-sync:github-sync-issue-detail-tab"] {
+  button[role="tab"][id$="trigger-plugin:paperclip-github-plugin:paperclip-github-plugin-issue-detail-tab"],
+  button[role="tab"][aria-controls$="content-plugin:paperclip-github-plugin:paperclip-github-plugin-issue-detail-tab"] {
     gap: 6px;
   }
 
-  button[role="tab"][id$="trigger-plugin:github-sync:github-sync-issue-detail-tab"]::before,
-  button[role="tab"][aria-controls$="content-plugin:github-sync:github-sync-issue-detail-tab"]::before {
+  button[role="tab"][id$="trigger-plugin:paperclip-github-plugin:paperclip-github-plugin-issue-detail-tab"]::before,
+  button[role="tab"][aria-controls$="content-plugin:paperclip-github-plugin:paperclip-github-plugin-issue-detail-tab"]::before {
     content: '';
     display: inline-block;
     width: 14px;
@@ -2034,7 +2034,7 @@ function getToneClass(tone: Tone): string {
 }
 
 const SETTINGS_INDEX_HREF = '/instance/settings/plugins';
-const GITHUB_SYNC_SETTINGS_UPDATED_EVENT = 'github-sync:settings-updated';
+const GITHUB_SYNC_SETTINGS_UPDATED_EVENT = 'paperclip-github-plugin:settings-updated';
 
 function getStringValue(record: Record<string, unknown>, key: string): string | null {
   const value = record[key];
@@ -2132,7 +2132,7 @@ function resolvePluginSettingsHref(records: unknown): string {
       getStringValue(record, 'displayName') ??
       (manifest ? getStringValue(manifest, 'displayName') : null);
 
-    if (id && (key === 'github-sync' || displayName === 'GitHub Sync')) {
+    if (id && (key === 'paperclip-github-plugin' || displayName === 'GitHub Sync')) {
       return `${SETTINGS_INDEX_HREF}/${id}`;
     }
   }

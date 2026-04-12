@@ -72,3 +72,8 @@ The plugin MUST persist repository mappings and sync state in plugin state.
 - The dashboard widget MUST summarize the current GitHub sync readiness and link to setup.
 - The settings page MUST render inside the real Paperclip host.
 - The plugin MUST include end-to-end automation that boots a disposable Paperclip instance, installs the plugin, and verifies the settings page renders.
+
+## Packaging and release requirements
+
+- The build pipeline MUST stamp the plugin manifest version from build-time package metadata rather than keeping a separately hardcoded manifest version.
+- The release workflow MUST derive the published version from the GitHub release tag and stamp that version into publishable package metadata before build and publish.

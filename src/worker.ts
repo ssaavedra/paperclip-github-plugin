@@ -3,17 +3,17 @@ import { definePlugin, runWorker, type Issue } from '@paperclipai/plugin-sdk';
 
 const SETTINGS_SCOPE = {
   scopeKind: 'instance' as const,
-  stateKey: 'github-sync-settings'
+  stateKey: 'paperclip-github-plugin-settings'
 };
 
 const SYNC_STATE_SCOPE = {
   scopeKind: 'instance' as const,
-  stateKey: 'github-sync-last-sync'
+  stateKey: 'paperclip-github-plugin-last-sync'
 };
 
 const IMPORT_REGISTRY_SCOPE = {
   scopeKind: 'instance' as const,
-  stateKey: 'github-sync-import-registry'
+  stateKey: 'paperclip-github-plugin-import-registry'
 };
 
 const DEFAULT_SCHEDULE_FREQUENCY_MINUTES = 15;
@@ -29,8 +29,8 @@ const MISSING_GITHUB_TOKEN_SYNC_ACTION = 'Open settings, add a GitHub token secr
 const MISSING_MAPPING_SYNC_MESSAGE = 'Save at least one mapping with a created Paperclip project before running sync.';
 const MISSING_MAPPING_SYNC_ACTION =
   'Open settings, add a repository mapping, let Paperclip create the target project, and then retry sync.';
-const ISSUE_LINK_ENTITY_TYPE = 'github-sync.issue-link';
-const COMMENT_ANNOTATION_ENTITY_TYPE = 'github-sync.comment-annotation';
+const ISSUE_LINK_ENTITY_TYPE = 'paperclip-github-plugin.issue-link';
+const COMMENT_ANNOTATION_ENTITY_TYPE = 'paperclip-github-plugin.comment-annotation';
 
 type PluginSetupContext = Parameters<Parameters<typeof definePlugin>[0]['setup']>[0];
 type PaperclipIssueStatus = Issue['status'];

@@ -41,4 +41,4 @@ await build({
   jsx: 'automatic'
 });
 
-console.log('[github-sync] build complete');
+console.log('[paperclip-github-plugin] build complete');

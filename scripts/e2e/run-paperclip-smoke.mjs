@@ -9,10 +9,10 @@ import net from 'node:net';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, '..', '..');
-const stateRoot = await mkdtemp(join(tmpdir(), 'github-sync-e2e-'));
+const stateRoot = await mkdtemp(join(tmpdir(), 'paperclip-github-plugin-e2e-'));
 const paperclipHome = join(stateRoot, 'paperclip-home');
 const dataDir = join(stateRoot, 'paperclip-data');
-const instanceId = 'github-sync-e2e';
+const instanceId = 'paperclip-github-plugin-e2e';
 const requestedPort = process.env.PAPERCLIP_E2E_PORT ? Number(process.env.PAPERCLIP_E2E_PORT) : 3100;
 const requestedDbPort = process.env.PAPERCLIP_E2E_DB_PORT ? Number(process.env.PAPERCLIP_E2E_DB_PORT) : 54329;
 const defaultTimeoutMs = 30000;
@@ -35,7 +35,7 @@ let serverPort;
 let embeddedDbPort;
 
 function log(message) {
-  console.log(`[github-sync:e2e] ${message}`);
+  console.log(`[paperclip-github-plugin:e2e] ${message}`);
 }
 
 function getPaperclipCommandArgs(args) {
@@ -242,7 +242,7 @@ async function ensureCompanySeeded() {
     method: 'POST',
     body: JSON.stringify({
       name: 'Dummy Company',
-      description: 'Seed company for github-sync e2e verification.'
+      description: 'Seed company for paperclip-github-plugin e2e verification.'
     })
   });
 
@@ -351,7 +351,7 @@ async function main() {
     'npx',
     getPaperclipCommandArgs(['plugin', 'install', '--local', pluginRoot, '--data-dir', dataDir, '--config', configPath])
   );
-  log('Installed local github-sync plugin.');
+  log('Installed local paperclip-github-plugin plugin.');
 
   const { chromium } = await import('playwright');
   const browser = await chromium.launch({ headless: true });

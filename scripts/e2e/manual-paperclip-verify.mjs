@@ -11,10 +11,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, '..', '..');
 const persistentStateRootInput = process.env.PAPERCLIP_E2E_STATE_DIR?.trim();
 const persistentStateRoot = persistentStateRootInput ? resolve(pluginRoot, persistentStateRootInput) : null;
-const stateRoot = persistentStateRoot ?? await mkdtemp(join(tmpdir(), 'github-sync-manual-'));
+const stateRoot = persistentStateRoot ?? await mkdtemp(join(tmpdir(), 'paperclip-github-plugin-manual-'));
 const paperclipHome = join(stateRoot, 'paperclip-home');
 const dataDir = join(stateRoot, 'paperclip-data');
-const instanceId = 'github-sync-manual';
+const instanceId = 'paperclip-github-plugin-manual';
 const requestedPort = process.env.PAPERCLIP_E2E_PORT ? Number(process.env.PAPERCLIP_E2E_PORT) : 3100;
 const requestedDbPort = process.env.PAPERCLIP_E2E_DB_PORT ? Number(process.env.PAPERCLIP_E2E_DB_PORT) : 54329;
 const env = {
@@ -41,7 +41,7 @@ let serverPort;
 let embeddedDbPort;
 
 function log(message) {
-  console.log(`[github-sync:manual] ${message}`);
+  console.log(`[paperclip-github-plugin:manual] ${message}`);
 }
 
 function getPaperclipCommandArgs(args) {
@@ -256,7 +256,7 @@ async function ensureCompanySeeded() {
     method: 'POST',
     body: JSON.stringify({
       name: 'Dummy Company',
-      description: 'Seed company for manual github-sync verification.'
+      description: 'Seed company for manual paperclip-github-plugin verification.'
     })
   });
 
@@ -270,10 +270,10 @@ async function ensurePluginInstalled(configPath) {
       'npx',
       getPaperclipCommandArgs(['plugin', 'install', '--local', pluginRoot, '--data-dir', dataDir, '--config', configPath])
     );
-    log('Installed local github-sync plugin.');
+    log('Installed local paperclip-github-plugin plugin.');
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (message.includes('Plugin already installed: github-sync')) {
+    if (message.includes('Plugin already installed: paperclip-github-plugin')) {
       log('Plugin already installed in the disposable instance; continuing.');
       return;
     }

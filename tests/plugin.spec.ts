@@ -240,7 +240,7 @@ function assertNormalizedPublicGitHubIssueDescription(description: string): void
 }
 
 test('manifest exposes GitHub Sync dashboard and settings UI metadata, config schema, and job', () => {
-  assert.equal(manifest.id, 'github-sync');
+  assert.equal(manifest.id, 'paperclip-github-plugin');
   assert.equal(manifest.apiVersion, 1);
   assert.equal(manifest.entrypoints.worker, './dist/worker.js');
   assert.equal(manifest.jobs?.[0]?.jobKey, 'sync.github-issues');
@@ -305,7 +305,7 @@ test('worker exposes toolbar sync state for global, project, and issue surfaces'
   });
 
   await harness.ctx.entities.upsert({
-    entityType: 'github-sync.issue-link',
+    entityType: 'paperclip-github-plugin.issue-link',
     scopeKind: 'issue',
     scopeId: issue.id,
     externalId: 'https://github.com/paperclipai/example-repo/issues/77',
@@ -417,7 +417,7 @@ test('worker issue.githubDetails returns issue-scoped GitHub detail payloads', a
   });
 
   await harness.ctx.entities.upsert({
-    entityType: 'github-sync.issue-link',
+    entityType: 'paperclip-github-plugin.issue-link',
     scopeKind: 'issue',
     scopeId: firstIssue.id,
     externalId: 'https://github.com/paperclipai/example-repo/issues/101',
@@ -436,7 +436,7 @@ test('worker issue.githubDetails returns issue-scoped GitHub detail payloads', a
     }
   });
   await harness.ctx.entities.upsert({
-    entityType: 'github-sync.issue-link',
+    entityType: 'paperclip-github-plugin.issue-link',
     scopeKind: 'issue',
     scopeId: secondIssue.id,
     externalId: 'https://github.com/paperclipai/example-repo/issues/202',
@@ -517,7 +517,7 @@ test('worker filters issue-scoped GitHub link records even when entities.list ig
   });
 
   await harness.ctx.entities.upsert({
-    entityType: 'github-sync.issue-link',
+    entityType: 'paperclip-github-plugin.issue-link',
     scopeKind: 'issue',
     scopeId: firstIssue.id,
     externalId: 'https://github.com/paperclipai/example-repo/issues/101',
@@ -536,7 +536,7 @@ test('worker filters issue-scoped GitHub link records even when entities.list ig
     }
   });
   await harness.ctx.entities.upsert({
-    entityType: 'github-sync.issue-link',
+    entityType: 'paperclip-github-plugin.issue-link',
     scopeKind: 'issue',
     scopeId: secondIssue.id,
     externalId: 'https://github.com/paperclipai/example-repo/issues/202',
@@ -562,7 +562,7 @@ test('worker filters issue-scoped GitHub link records even when entities.list ig
       input &&
       typeof input === 'object' &&
       'entityType' in input &&
-      (input as { entityType?: unknown }).entityType === 'github-sync.issue-link' &&
+      (input as { entityType?: unknown }).entityType === 'paperclip-github-plugin.issue-link' &&
       'scopeKind' in input &&
       (input as { scopeKind?: unknown }).scopeKind === 'issue' &&
       'scopeId' in input
@@ -757,7 +757,7 @@ test('settings.registration returns a cumulative synced issue total deduped by G
   await harness.ctx.state.set(
     {
       scopeKind: 'instance',
-      stateKey: 'github-sync-settings'
+      stateKey: 'paperclip-github-plugin-settings'
     },
     {
       mappings: [
@@ -780,7 +780,7 @@ test('settings.registration returns a cumulative synced issue total deduped by G
   await harness.ctx.state.set(
     {
       scopeKind: 'instance',
-      stateKey: 'github-sync-import-registry'
+      stateKey: 'paperclip-github-plugin-import-registry'
     },
     [
       {
@@ -1199,7 +1199,7 @@ test('worker imports GitHub issues as top-level Paperclip issues and skips them 
 
     const importRegistryAfterFirstSync = harness.getState({
       scopeKind: 'instance',
-      stateKey: 'github-sync-import-registry'
+      stateKey: 'paperclip-github-plugin-import-registry'
     }) as Array<{ githubIssueId: number }>;
 
     assert.deepEqual(
@@ -1351,7 +1351,7 @@ test('worker keeps deduplicating imported issues when the mapping id changes', a
 
     const importRegistry = harness.getState({
       scopeKind: 'instance',
-      stateKey: 'github-sync-import-registry'
+      stateKey: 'paperclip-github-plugin-import-registry'
     }) as Array<{
       mappingId: string;
       githubIssueId: number;
@@ -1481,7 +1481,7 @@ test('worker repairs missing import registry entries by reusing existing importe
 
     const importRegistry = harness.getState({
       scopeKind: 'instance',
-      stateKey: 'github-sync-import-registry'
+      stateKey: 'paperclip-github-plugin-import-registry'
     }) as Array<{
       mappingId: string;
       githubIssueId: number;
@@ -3500,7 +3500,7 @@ test('worker uses the live Paperclip API URL passed to sync.runNow instead of a 
 
     const persistedSettings = harness.getState({
       scopeKind: 'instance',
-      stateKey: 'github-sync-settings'
+      stateKey: 'paperclip-github-plugin-settings'
     }) as {
       paperclipApiBaseUrl?: string;
     };
@@ -3707,7 +3707,7 @@ test('worker maps GitHub issue and linked PR state onto Paperclip statuses while
   await harness.ctx.state.set(
     {
       scopeKind: 'instance',
-      stateKey: 'github-sync-import-registry'
+      stateKey: 'paperclip-github-plugin-import-registry'
     },
     [
       {
@@ -4114,7 +4114,7 @@ test('worker maps GitHub issue and linked PR state onto Paperclip statuses while
 
     const importRegistry = harness.getState({
       scopeKind: 'instance',
-      stateKey: 'github-sync-import-registry'
+      stateKey: 'paperclip-github-plugin-import-registry'
     }) as Array<{ githubIssueNumber?: number; lastSeenCommentCount?: number; githubIssueId: number }>;
 
     assert.equal(importRegistry.find((entry) => entry.githubIssueId === 3002)?.lastSeenCommentCount, 2);
@@ -4168,7 +4168,7 @@ test('worker ignores linked pull requests from other repositories', async () => 
   await harness.ctx.state.set(
     {
       scopeKind: 'instance',
-      stateKey: 'github-sync-import-registry'
+      stateKey: 'paperclip-github-plugin-import-registry'
     },
     [
       {
@@ -4476,7 +4476,7 @@ test('worker continues importing later issues when one issue import fails', asyn
 
     const importRegistry = harness.getState({
       scopeKind: 'instance',
-      stateKey: 'github-sync-import-registry'
+      stateKey: 'paperclip-github-plugin-import-registry'
     }) as Array<{ githubIssueId: number; githubIssueNumber?: number }>;
 
     assert.deepEqual(importRegistry.map((entry) => entry.githubIssueId), [5002]);
@@ -4528,7 +4528,7 @@ test('worker uses the local Paperclip issue PATCH API for status transitions whe
   await harness.ctx.state.set(
     {
       scopeKind: 'instance',
-      stateKey: 'github-sync-import-registry'
+      stateKey: 'paperclip-github-plugin-import-registry'
     },
     [
       {
@@ -4734,7 +4734,7 @@ test('worker stores repository and issue diagnostics when a sync fails mid-run',
   await harness.ctx.state.set(
     {
       scopeKind: 'instance',
-      stateKey: 'github-sync-import-registry'
+      stateKey: 'paperclip-github-plugin-import-registry'
     },
     [
       {
@@ -4824,7 +4824,7 @@ test('worker stores repository and issue diagnostics when a sync fails mid-run',
 
     const savedState = harness.getState({
       scopeKind: 'instance',
-      stateKey: 'github-sync-settings'
+      stateKey: 'paperclip-github-plugin-settings'
     }) as {
       syncState: {
         status: string;
@@ -4902,7 +4902,7 @@ test('settings registration clears legacy setup errors once the missing token is
   await harness.ctx.state.set(
     {
       scopeKind: 'instance',
-      stateKey: 'github-sync-settings'
+      stateKey: 'paperclip-github-plugin-settings'
     },
     {
       mappings: [],
@@ -4937,7 +4937,7 @@ test('settings registration clears legacy setup errors once the missing token is
 
   const savedState = harness.getState({
     scopeKind: 'instance',
-    stateKey: 'github-sync-settings'
+    stateKey: 'paperclip-github-plugin-settings'
   }) as {
     syncState?: {
       status?: string;
@@ -4969,7 +4969,7 @@ test('saving setup clears stale setup errors instead of resaving them from the U
   await harness.ctx.state.set(
     {
       scopeKind: 'instance',
-      stateKey: 'github-sync-settings'
+      stateKey: 'paperclip-github-plugin-settings'
     },
     {
       mappings: [],
@@ -5123,7 +5123,7 @@ test('scheduled job skips while a GitHub rate limit pause is active and resumes 
   await harness.ctx.state.set(
     {
       scopeKind: 'instance',
-      stateKey: 'github-sync-settings'
+      stateKey: 'paperclip-github-plugin-settings'
     },
     {
       mappings: [mapping],
@@ -5216,7 +5216,7 @@ test('scheduled job skips while a GitHub rate limit pause is active and resumes 
 
     const pausedState = harness.getState({
       scopeKind: 'instance',
-      stateKey: 'github-sync-settings'
+      stateKey: 'paperclip-github-plugin-settings'
     }) as {
       syncState: {
         status: string;
@@ -5236,7 +5236,7 @@ test('scheduled job skips while a GitHub rate limit pause is active and resumes 
 
     const resumedState = harness.getState({
       scopeKind: 'instance',
-      stateKey: 'github-sync-settings'
+      stateKey: 'paperclip-github-plugin-settings'
     }) as {
       syncState: {
         status: string;
@@ -5372,7 +5372,7 @@ test('worker keeps progress in preparing while warming GitHub review and CI data
     await waitFor(() => {
       const current = harness.getState({
         scopeKind: 'instance',
-        stateKey: 'github-sync-settings'
+        stateKey: 'paperclip-github-plugin-settings'
       }) as {
         syncState?: {
           status?: string;
@@ -5395,7 +5395,7 @@ test('worker keeps progress in preparing while warming GitHub review and CI data
     await waitFor(() => {
       const current = harness.getState({
         scopeKind: 'instance',
-        stateKey: 'github-sync-settings'
+        stateKey: 'paperclip-github-plugin-settings'
       }) as {
         syncState?: { status?: string };
       } | undefined;
@@ -5503,7 +5503,7 @@ test('worker returns a running state for long manual syncs and persists the fina
 
     const runningState = harness.getState({
       scopeKind: 'instance',
-      stateKey: 'github-sync-settings'
+      stateKey: 'paperclip-github-plugin-settings'
     }) as {
       syncState: { status: string };
     };
@@ -5513,7 +5513,7 @@ test('worker returns a running state for long manual syncs and persists the fina
     await waitFor(() => {
       const current = harness.getState({
         scopeKind: 'instance',
-        stateKey: 'github-sync-settings'
+        stateKey: 'paperclip-github-plugin-settings'
       }) as {
         syncState?: { status?: string };
       } | undefined;
@@ -5523,7 +5523,7 @@ test('worker returns a running state for long manual syncs and persists the fina
 
     const completedState = harness.getState({
       scopeKind: 'instance',
-      stateKey: 'github-sync-settings'
+      stateKey: 'paperclip-github-plugin-settings'
     }) as {
       syncState: {
         status: string;
@@ -5659,7 +5659,7 @@ test('worker persists live sync progress and imported counts before a long-runni
     await waitFor(() => {
       const current = harness.getState({
         scopeKind: 'instance',
-        stateKey: 'github-sync-settings'
+        stateKey: 'paperclip-github-plugin-settings'
       }) as {
         syncState?: {
           status?: string;
@@ -5688,7 +5688,7 @@ test('worker persists live sync progress and imported counts before a long-runni
     await waitFor(() => {
       const current = harness.getState({
         scopeKind: 'instance',
-        stateKey: 'github-sync-settings'
+        stateKey: 'paperclip-github-plugin-settings'
       }) as {
         syncState?: { status?: string };
       } | undefined;
@@ -5698,7 +5698,7 @@ test('worker persists live sync progress and imported counts before a long-runni
 
     const completedState = harness.getState({
       scopeKind: 'instance',
-      stateKey: 'github-sync-settings'
+      stateKey: 'paperclip-github-plugin-settings'
     }) as {
       syncState: {
         status: string;
@@ -5724,7 +5724,7 @@ test('scheduled job skips runs that are not yet due for the configured cadence',
   await harness.ctx.state.set(
     {
       scopeKind: 'instance',
-      stateKey: 'github-sync-settings'
+      stateKey: 'paperclip-github-plugin-settings'
     },
     {
       mappings: [],
@@ -5744,7 +5744,7 @@ test('scheduled job skips runs that are not yet due for the configured cadence',
 
   const state = harness.getState({
     scopeKind: 'instance',
-    stateKey: 'github-sync-settings'
+    stateKey: 'paperclip-github-plugin-settings'
   }) as {
     scheduleFrequencyMinutes: number;
     syncState: { status: string; checkedAt?: string; message?: string };
@@ -5763,7 +5763,7 @@ test('scheduled job skips incomplete setup instead of recording a sync error', a
   await harness.ctx.state.set(
     {
       scopeKind: 'instance',
-      stateKey: 'github-sync-settings'
+      stateKey: 'paperclip-github-plugin-settings'
     },
     {
       mappings: [],
@@ -5783,7 +5783,7 @@ test('scheduled job skips incomplete setup instead of recording a sync error', a
 
   const state = harness.getState({
     scopeKind: 'instance',
-    stateKey: 'github-sync-settings'
+    stateKey: 'paperclip-github-plugin-settings'
   }) as {
     syncState: { status: string; checkedAt?: string; message?: string; lastRunTrigger?: string };
   };
@@ -5806,7 +5806,7 @@ test('scheduled job skips repository setup gaps instead of recording a missing-m
   await harness.ctx.state.set(
     {
       scopeKind: 'instance',
-      stateKey: 'github-sync-settings'
+      stateKey: 'paperclip-github-plugin-settings'
     },
     {
       mappings: [],
@@ -5826,7 +5826,7 @@ test('scheduled job skips repository setup gaps instead of recording a missing-m
 
   const state = harness.getState({
     scopeKind: 'instance',
-    stateKey: 'github-sync-settings'
+    stateKey: 'paperclip-github-plugin-settings'
   }) as {
     syncState: { status: string; checkedAt?: string; message?: string; lastRunTrigger?: string };
   };
@@ -5928,7 +5928,7 @@ test('scheduled job starts long syncs in the background so the scheduler does no
 
     const runningState = harness.getState({
       scopeKind: 'instance',
-      stateKey: 'github-sync-settings'
+      stateKey: 'paperclip-github-plugin-settings'
     }) as {
       syncState: {
         status: string;
@@ -5948,7 +5948,7 @@ test('scheduled job starts long syncs in the background so the scheduler does no
     await waitFor(() => {
       const current = harness.getState({
         scopeKind: 'instance',
-        stateKey: 'github-sync-settings'
+        stateKey: 'paperclip-github-plugin-settings'
       }) as {
         syncState?: { status?: string };
       } | undefined;
@@ -5958,7 +5958,7 @@ test('scheduled job starts long syncs in the background so the scheduler does no
 
     const completedState = harness.getState({
       scopeKind: 'instance',
-      stateKey: 'github-sync-settings'
+      stateKey: 'paperclip-github-plugin-settings'
     }) as {
       syncState: {
         status: string;

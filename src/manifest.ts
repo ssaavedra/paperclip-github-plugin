@@ -1,12 +1,20 @@
+import { createRequire } from 'node:module';
 import type { PaperclipPluginManifestV1 } from '@paperclipai/plugin-sdk';
 
+const require = createRequire(import.meta.url);
+const packageJson = require('../package.json') as { version?: unknown };
 const DASHBOARD_WIDGET_CAPABILITY = 'ui.dashboardWidget.register' as unknown as PaperclipPluginManifestV1['capabilities'][number];
 const SCHEDULE_TICK_CRON = '* * * * *';
+const MANIFEST_VERSION =
+  process.env.PLUGIN_VERSION?.trim()
+  || (typeof packageJson.version === 'string' && packageJson.version.trim())
+  || process.env.npm_package_version?.trim()
+  || '0.0.0-dev';
 
 export const manifest: PaperclipPluginManifestV1 = {
-  id: 'github-sync',
+  id: 'paperclip-github-plugin',
   apiVersion: 1,
-  version: '0.1.2',
+  version: MANIFEST_VERSION,
   displayName: 'GitHub Sync',
   description: 'Synchronize GitHub issues into Paperclip projects.',
   author: 'Álvaro Sánchez-Mariscal',
@@ -55,40 +63,40 @@ export const manifest: PaperclipPluginManifestV1 = {
     slots: [
       {
         type: 'dashboardWidget',
-        id: 'github-sync-dashboard-widget',
+        id: 'paperclip-github-plugin-dashboard-widget',
         displayName: 'GitHub Sync',
         exportName: 'GitHubSyncDashboardWidget'
       },
       {
         type: 'detailTab',
-        id: 'github-sync-issue-detail-tab',
+        id: 'paperclip-github-plugin-issue-detail-tab',
         displayName: 'GitHub',
         exportName: 'GitHubSyncIssueDetailTab',
         entityTypes: ['issue']
       },
       {
         type: 'commentAnnotation',
-        id: 'github-sync-comment-annotation',
+        id: 'paperclip-github-plugin-comment-annotation',
         displayName: 'GitHub Sync Links',
         exportName: 'GitHubSyncCommentAnnotation',
         entityTypes: ['comment']
       },
       {
         type: 'globalToolbarButton',
-        id: 'github-sync-global-toolbar-button',
+        id: 'paperclip-github-plugin-global-toolbar-button',
         displayName: 'GitHub Sync',
         exportName: 'GitHubSyncGlobalToolbarButton'
       },
       {
         type: 'toolbarButton',
-        id: 'github-sync-toolbar-button',
+        id: 'paperclip-github-plugin-toolbar-button',
         displayName: 'GitHub Sync',
         exportName: 'GitHubSyncEntityToolbarButton',
         entityTypes: ['project', 'issue']
       },
       {
         type: 'settingsPage',
-        id: 'github-sync-settings-page',
+        id: 'paperclip-github-plugin-settings-page',
         displayName: 'GitHub Sync',
         exportName: 'GitHubSyncSettingsPage'
       }

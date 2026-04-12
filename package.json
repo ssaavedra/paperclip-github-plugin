@@ -1,5 +1,5 @@
 {
-  "name": "paperclip-github",
+  "name": "paperclip-github-plugin",
   "version": "0.1.2",
   "description": "Paperclip plugin for synchronizing GitHub issues into Paperclip projects.",
   "license": "Apache-2.0",
@@ -10,11 +10,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/alvarosanchez/paperclip-github.git"
+    "url": "git+https://github.com/alvarosanchez/paperclip-github-plugin.git"
   },
-  "homepage": "https://github.com/alvarosanchez/paperclip-github#readme",
+  "homepage": "https://github.com/alvarosanchez/paperclip-github-plugin#readme",
   "bugs": {
-    "url": "https://github.com/alvarosanchez/paperclip-github/issues"
+    "url": "https://github.com/alvarosanchez/paperclip-github-plugin/issues"
   },
   "files": [
     "dist",

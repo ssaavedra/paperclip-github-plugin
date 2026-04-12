@@ -1,4 +1,4 @@
-# paperclip-github
+# paperclip-github-plugin
 
 GitHub Sync is a Paperclip plugin that connects GitHub repositories to Paperclip projects and keeps GitHub issues synchronized into your Paperclip workspace.
 
@@ -145,6 +145,15 @@ Imported issues stay linked to GitHub and continue to receive description, label
 - `pnpm build` bundles the plugin into `dist/`.
 - `pnpm test:e2e` builds the plugin, boots an isolated Paperclip instance, installs the plugin, and verifies the hosted settings page renders.
 - `pnpm verify:manual` builds the plugin, boots a Paperclip instance for manual inspection, and opens the plugin settings page.
+
+## Release process
+
+- Publishing is driven by `.github/workflows/release.yml`.
+- The npm publish job is triggered by a published GitHub Release.
+- The published version is derived from the GitHub release tag, not from the committed `package.json` version.
+- Tags may be either `1.2.3` or `v1.2.3`; the workflow normalizes both to `1.2.3`.
+- During the release workflow, the package version is stamped from the tag before build and publish, and the built plugin manifest uses that same resolved version.
+- The release workflow is intended for npm trusted publishing through GitHub Actions OIDC, so no long-lived `NPM_TOKEN` secret is required when trusted publishing is configured correctly.
 
 ## License
 
