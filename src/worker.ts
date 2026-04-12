@@ -1,6 +1,8 @@
 import { Octokit } from '@octokit/rest';
 import { definePlugin, runWorker, type Issue } from '@paperclipai/plugin-sdk';
 
+import { normalizePaperclipHealthResponse, requiresPaperclipBoardAccess } from './paperclip-health.ts';
+
 const SETTINGS_SCOPE = {
   scopeKind: 'instance' as const,
   stateKey: 'paperclip-github-plugin-settings'
@@ -29,6 +31,10 @@ const MISSING_GITHUB_TOKEN_SYNC_ACTION = 'Open settings, add a GitHub token secr
 const MISSING_MAPPING_SYNC_MESSAGE = 'Save at least one mapping with a created Paperclip project before running sync.';
 const MISSING_MAPPING_SYNC_ACTION =
   'Open settings, add a repository mapping, let Paperclip create the target project, and then retry sync.';
+const MISSING_BOARD_ACCESS_SYNC_MESSAGE =
+  'Connect Paperclip board access before running sync on this authenticated deployment.';
+const MISSING_BOARD_ACCESS_SYNC_ACTION =
+  'Open plugin settings for each mapped company that sync will touch, connect Paperclip board access, approve the flow, and then run sync again.';
 const ISSUE_LINK_ENTITY_TYPE = 'paperclip-github-plugin.issue-link';
 const COMMENT_ANNOTATION_ENTITY_TYPE = 'paperclip-github-plugin.comment-annotation';
 
@@ -40,11 +46,44 @@ type PaperclipIssueUpdatePatchWithLabels = Parameters<PluginSetupContext['issues
   labels?: PaperclipIssueLabel[];
 };
 type PaperclipLabelDirectory = Map<string, PaperclipIssueLabel[]>;
+type PaperclipBoardApiTokenRefs = Record<string, string>;
+
+interface PaperclipApiOperationFailure {
+  status?: number;
+  errorMessage?: string;
+  requiresAuthentication?: boolean;
+}
+
+interface PaperclipApiJsonReadResult<T> {
+  data?: T;
+  failure?: PaperclipApiOperationFailure;
+}
 
 interface PaperclipLabelCreationAttempt {
   label: PaperclipIssueLabel | null;
-  status?: number;
-  errorMessage?: string;
+  failure?: PaperclipApiOperationFailure;
+}
+
+interface PaperclipLabelLookupResult {
+  directory: PaperclipLabelDirectory | null;
+  failure?: PaperclipApiOperationFailure;
+}
+
+interface ResolvedPaperclipLabelResult {
+  label: PaperclipIssueLabel | null;
+  failure?: PaperclipApiOperationFailure;
+}
+
+interface PaperclipIssueLabelResolutionResult {
+  labels: PaperclipIssueLabel[];
+  unresolvedGitHubLabels: GitHubIssueLabelRecord[];
+  failure?: PaperclipApiOperationFailure;
+}
+
+interface PaperclipIssueCreateResult {
+  id: string;
+  unresolvedGitHubLabels: GitHubIssueLabelRecord[];
+  labelResolutionFailure?: PaperclipApiOperationFailure;
 }
 
 interface RepositoryMapping {
@@ -79,7 +118,7 @@ type SyncFailurePhase =
   | 'evaluating_github_status'
   | 'updating_paperclip_status';
 
-type SyncConfigurationIssue = 'missing_token' | 'missing_mapping';
+type SyncConfigurationIssue = 'missing_token' | 'missing_mapping' | 'missing_board_access';
 
 type SyncProgressPhase = 'preparing' | 'importing' | 'syncing';
 
@@ -202,16 +241,70 @@ interface GitHubSyncSettings {
   scheduleFrequencyMinutes: number;
   paperclipApiBaseUrl?: string;
   githubTokenRef?: string;
+  paperclipBoardApiTokenRefs?: PaperclipBoardApiTokenRefs;
   totalSyncedIssuesCount?: number;
   updatedAt?: string;
 }
 
 interface GitHubSyncConfig {
   githubTokenRef?: string;
+  paperclipBoardApiTokenRefs?: PaperclipBoardApiTokenRefs;
+}
+
+function normalizeCompanyId(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
 let activeSyncPromise: Promise<GitHubSyncSettings> | null = null;
 let activeRunningSyncState: GitHubSyncSettings | null = null;
+let activePaperclipApiAuthTokensByCompanyId: Map<string, string> | null = null;
+
+class PaperclipLabelSyncError extends Error {
+  readonly name = 'PaperclipLabelSyncError';
+  readonly status?: number;
+  readonly paperclipApiBaseUrl?: string;
+  readonly requiresAuthentication: boolean;
+  readonly labelNames: string[];
+
+  constructor(params: {
+    labelNames: string[];
+    paperclipApiBaseUrl?: string;
+    failure?: PaperclipApiOperationFailure;
+  }) {
+    const labelNames = [...new Set(params.labelNames.map((value) => value.trim()).filter(Boolean))];
+    const failure = params.failure;
+    const labelList = labelNames.map((value) => `"${value}"`).join(', ');
+    const labelSubject =
+      labelNames.length === 1 ? `the GitHub label ${labelList}` : `the GitHub labels ${labelList}`;
+    const location = params.paperclipApiBaseUrl ? ` at ${params.paperclipApiBaseUrl}` : '';
+
+    let message: string;
+    if (failure?.requiresAuthentication) {
+      message =
+        `Could not map ${labelSubject} because the worker reached an authenticated Paperclip API response${location} instead of JSON. `
+        + 'Connect Paperclip board access in plugin settings, set `PAPERCLIP_API_URL` to a worker-accessible Paperclip API origin, or expose the local Paperclip API to the worker without browser-session auth.';
+    } else if (failure?.status === 404 || failure?.status === 405) {
+      message =
+        `Could not map ${labelSubject} because the Paperclip label API${location} is not available to the worker. `
+        + 'Set `PAPERCLIP_API_URL` to a worker-accessible Paperclip API origin, then retry sync.';
+    } else if (failure?.errorMessage) {
+      message = `Could not map ${labelSubject} because the Paperclip label API${location} failed: ${failure.errorMessage}`;
+    } else if (params.paperclipApiBaseUrl) {
+      message = `Could not map ${labelSubject} because the Paperclip label API at ${params.paperclipApiBaseUrl} is unavailable to the worker.`;
+    } else {
+      message =
+        `Could not map ${labelSubject} because no worker-accessible Paperclip label API is configured. `
+        + 'Set `PAPERCLIP_API_URL` to a worker-accessible Paperclip API origin, then retry sync.';
+    }
+
+    super(message);
+
+    this.status = failure?.status;
+    this.paperclipApiBaseUrl = params.paperclipApiBaseUrl;
+    this.requiresAuthentication = Boolean(failure?.requiresAuthentication);
+    this.labelNames = labelNames;
+  }
+}
 
 interface GitHubIssueRecord {
   id: number;
@@ -638,6 +731,10 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isPaperclipLabelSyncError(error: unknown): error is PaperclipLabelSyncError {
+  return error instanceof PaperclipLabelSyncError;
+}
+
 function getErrorResponseHeaders(error: unknown): Record<string, string> {
   if (!error || typeof error !== 'object' || !('response' in error)) {
     return {};
@@ -714,8 +811,12 @@ function parseRetryAfterTimestamp(value: string | undefined, now = Date.now()): 
   return Number.isFinite(timestamp) ? timestamp : undefined;
 }
 
-function normalizeGitHubTokenRef(value: unknown): string | undefined {
+function normalizeSecretRef(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function normalizeGitHubTokenRef(value: unknown): string | undefined {
+  return normalizeSecretRef(value);
 }
 
 function formatUtcTimestamp(value: string): string {
@@ -1045,6 +1146,22 @@ function buildSyncFailureMessage(error: unknown, context: SyncFailureContext): s
     return rawMessage;
   }
 
+  if (isPaperclipLabelSyncError(error)) {
+    if (repositoryLabel && context.githubIssueNumber !== undefined) {
+      return `Sync failed while ${phaseLabel} for ${repositoryLabel} issue #${context.githubIssueNumber}. ${rawMessage}`;
+    }
+
+    if (repositoryLabel) {
+      return `Sync failed while ${phaseLabel} for ${repositoryLabel}. ${rawMessage}`;
+    }
+
+    if (context.githubIssueNumber !== undefined) {
+      return `Sync failed while ${phaseLabel} for GitHub issue #${context.githubIssueNumber}. ${rawMessage}`;
+    }
+
+    return `Sync failed while ${phaseLabel}. ${rawMessage}`;
+  }
+
   if (repositoryLabel && context.githubIssueNumber !== undefined) {
     return `Sync failed while ${phaseLabel} for ${repositoryLabel} issue #${context.githubIssueNumber}.`;
   }
@@ -1077,6 +1194,18 @@ function getSyncFailureSuggestedAction(error: unknown, context: SyncFailureConte
   const rateLimitPause = getGitHubRateLimitPauseDetails(error);
   if (rateLimitPause) {
     return `GitHub rate limiting paused the sync. Wait until ${formatUtcTimestamp(rateLimitPause.resetAt)} before retrying.`;
+  }
+
+  if (isPaperclipLabelSyncError(error)) {
+    if (error.requiresAuthentication || error.status === 401 || error.status === 403) {
+      return 'The worker could not reuse the board login session for the Paperclip label API. Connect Paperclip board access in settings, or set `PAPERCLIP_API_URL` to a worker-accessible Paperclip API origin, then retry sync.';
+    }
+
+    if (error.paperclipApiBaseUrl) {
+      return `Confirm that the Paperclip label API at ${error.paperclipApiBaseUrl} is reachable from the plugin worker and returns JSON, then retry sync.`;
+    }
+
+    return 'Set `PAPERCLIP_API_URL` to a worker-accessible Paperclip API origin, then retry sync.';
   }
 
   const rawMessage = getErrorMessage(error).trim().toLowerCase();
@@ -1699,6 +1828,10 @@ function getLegacySyncConfigurationIssue(syncState: SyncRunState): SyncConfigura
     return 'missing_mapping';
   }
 
+  if (message === MISSING_BOARD_ACCESS_SYNC_MESSAGE || suggestedAction === MISSING_BOARD_ACCESS_SYNC_ACTION) {
+    return 'missing_board_access';
+  }
+
   return null;
 }
 
@@ -1711,6 +1844,7 @@ function clearResolvedSetupConfigurationSyncState(
   setup: {
     hasToken: boolean;
     hasMappings: boolean;
+    hasBoardAccess?: boolean;
   }
 ): SyncRunState {
   const configurationIssue = getSyncConfigurationIssue(syncState);
@@ -1726,6 +1860,10 @@ function clearResolvedSetupConfigurationSyncState(
     return createIdleSyncState();
   }
 
+  if (configurationIssue === 'missing_board_access' && setup.hasBoardAccess) {
+    return createIdleSyncState();
+  }
+
   return syncState;
 }
 
@@ -1734,6 +1872,7 @@ function sanitizeSettingsForCurrentSetup(
   setup: {
     hasToken: boolean;
     hasMappings: boolean;
+    hasBoardAccess?: boolean;
   }
 ): GitHubSyncSettings {
   const syncState = clearResolvedSetupConfigurationSyncState(settings.syncState, setup);
@@ -1745,8 +1884,14 @@ function sanitizeSettingsForCurrentSetup(
       };
 }
 
-function getPublicSettings(settings: GitHubSyncSettings): Omit<GitHubSyncSettings, 'githubTokenRef'> {
-  const { githubTokenRef: _githubTokenRef, ...publicSettings } = settings;
+function getPublicSettings(
+  settings: GitHubSyncSettings
+): Omit<GitHubSyncSettings, 'githubTokenRef' | 'paperclipBoardApiTokenRefs'> {
+  const {
+    githubTokenRef: _githubTokenRef,
+    paperclipBoardApiTokenRefs: _paperclipBoardApiTokenRefs,
+    ...publicSettings
+  } = settings;
   return publicSettings;
 }
 
@@ -1781,6 +1926,20 @@ function createSetupConfigurationErrorSyncState(
           phase: 'configuration',
           configurationIssue: 'missing_mapping',
           suggestedAction: MISSING_MAPPING_SYNC_ACTION
+        }
+      });
+    case 'missing_board_access':
+      return createErrorSyncState({
+        message: MISSING_BOARD_ACCESS_SYNC_MESSAGE,
+        trigger,
+        syncedIssuesCount: 0,
+        createdIssuesCount: 0,
+        skippedIssuesCount: 0,
+        erroredIssuesCount: 0,
+        errorDetails: {
+          phase: 'configuration',
+          configurationIssue: 'missing_board_access',
+          suggestedAction: MISSING_BOARD_ACCESS_SYNC_ACTION
         }
       });
   }
@@ -1913,8 +2072,31 @@ function normalizeConfig(value: unknown): GitHubSyncConfig {
 
   const record = value as Record<string, unknown>;
   return {
-    githubTokenRef: typeof record.githubTokenRef === 'string' ? record.githubTokenRef : undefined
+    githubTokenRef: typeof record.githubTokenRef === 'string' ? record.githubTokenRef : undefined,
+    paperclipBoardApiTokenRefs: normalizePaperclipBoardApiTokenRefs(record.paperclipBoardApiTokenRefs)
   };
+}
+
+function normalizePaperclipBoardApiTokenRefs(value: unknown): PaperclipBoardApiTokenRefs | undefined {
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+
+  const entries = Object.entries(value as Record<string, unknown>)
+    .map(([companyId, secretRef]) => {
+      const normalizedCompanyId = normalizeCompanyId(companyId);
+      const normalizedSecretRef = normalizeSecretRef(secretRef);
+      return normalizedCompanyId && normalizedSecretRef
+        ? [normalizedCompanyId, normalizedSecretRef] as const
+        : null;
+    })
+    .filter((entry): entry is readonly [string, string] => entry !== null);
+
+  if (entries.length === 0) {
+    return undefined;
+  }
+
+  return Object.fromEntries(entries);
 }
 
 function normalizeSyncState(value: unknown): SyncRunState {
@@ -1953,7 +2135,7 @@ function normalizeMappings(value: unknown): RepositoryMapping[] {
     const repositoryInput = typeof record.repositoryUrl === 'string' ? record.repositoryUrl : '';
     const paperclipProjectName = typeof record.paperclipProjectName === 'string' ? record.paperclipProjectName : '';
     const paperclipProjectId = typeof record.paperclipProjectId === 'string' ? record.paperclipProjectId : undefined;
-    const companyId = typeof record.companyId === 'string' ? record.companyId : undefined;
+    const companyId = normalizeCompanyId(record.companyId);
     const parsedRepository = parseRepositoryReference(repositoryInput);
 
     return {
@@ -2034,6 +2216,7 @@ function normalizeSettings(value: unknown): GitHubSyncSettings {
   const record = value as Record<string, unknown>;
   const paperclipApiBaseUrl = resolvePaperclipApiBaseUrl(record.paperclipApiBaseUrl);
   const githubTokenRef = normalizeGitHubTokenRef(record.githubTokenRef);
+  const paperclipBoardApiTokenRefs = normalizePaperclipBoardApiTokenRefs(record.paperclipBoardApiTokenRefs);
 
   return {
     mappings: normalizeMappings(record.mappings),
@@ -2041,6 +2224,7 @@ function normalizeSettings(value: unknown): GitHubSyncSettings {
     scheduleFrequencyMinutes: normalizeScheduleFrequencyMinutes(record.scheduleFrequencyMinutes),
     ...(paperclipApiBaseUrl ? { paperclipApiBaseUrl } : {}),
     ...(githubTokenRef ? { githubTokenRef } : {}),
+    ...(paperclipBoardApiTokenRefs ? { paperclipBoardApiTokenRefs } : {}),
     updatedAt: typeof record.updatedAt === 'string' ? record.updatedAt : undefined
   };
 }
@@ -3672,11 +3856,72 @@ function getPaperclipIssueEndpoint(baseUrl: string, issueId: string): string {
   return new URL(`/api/issues/${issueId}`, baseUrl).toString();
 }
 
-async function fetchPaperclipApi(url: string, init?: RequestInit): Promise<Response> {
+function getPaperclipHealthEndpoint(baseUrl: string): string {
+  return new URL('/api/health', baseUrl).toString();
+}
+
+function getActivePaperclipApiAuthToken(companyId?: string): string | undefined {
+  if (!companyId) {
+    return undefined;
+  }
+
+  const token = activePaperclipApiAuthTokensByCompanyId?.get(companyId);
+  return typeof token === 'string' && token.trim() ? token.trim() : undefined;
+}
+
+function applyPaperclipApiAuthentication(
+  init: RequestInit | undefined,
+  companyId?: string
+): RequestInit | undefined {
+  const token = getActivePaperclipApiAuthToken(companyId);
+  if (!token) {
+    return init;
+  }
+
+  const headers = new Headers(init?.headers ?? undefined);
+  if (!headers.has('authorization')) {
+    headers.set('authorization', `Bearer ${token}`);
+  }
+
+  return {
+    ...init,
+    headers
+  };
+}
+
+async function fetchPaperclipApi(
+  url: string,
+  init?: RequestInit,
+  options?: {
+    companyId?: string;
+  }
+): Promise<Response> {
   // Use direct worker-side fetch here. The host-managed `ctx.http.fetch(...)`
   // proxy rejects loopback/private IPs such as `127.0.0.1`, but the local
   // Paperclip REST API is intentionally served from the host machine.
-  return fetch(url, init);
+  return fetch(url, applyPaperclipApiAuthentication(init, options?.companyId));
+}
+
+async function detectPaperclipBoardAccessRequirement(paperclipApiBaseUrl?: string): Promise<boolean> {
+  if (!paperclipApiBaseUrl) {
+    return false;
+  }
+
+  try {
+    const response = await fetchPaperclipApi(getPaperclipHealthEndpoint(paperclipApiBaseUrl), {
+      method: 'GET',
+      headers: {
+        accept: 'application/json'
+      }
+    });
+    const payloadResult = await readPaperclipApiJsonResponse<unknown>(response, {
+      operationLabel: 'health'
+    });
+    const health = normalizePaperclipHealthResponse(payloadResult.data);
+    return Boolean(health && requiresPaperclipBoardAccess(health));
+  } catch {
+    return false;
+  }
 }
 
 function parsePaperclipIssueId(value: unknown): string | null {
@@ -3708,6 +3953,145 @@ function parsePaperclipIssueDescription(value: unknown): string | null | undefin
   }
 
   return undefined;
+}
+
+function isJsonContentType(value: string | null | undefined): boolean {
+  if (!value) {
+    return false;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  return normalized.includes('/json') || normalized.includes('+json');
+}
+
+function looksLikeHtmlDocument(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  return /^<!doctype html/i.test(trimmed) || /^<html[\s>]/i.test(trimmed) || /<\/body>/i.test(trimmed);
+}
+
+function looksLikeLoginHtmlDocument(value: string): boolean {
+  if (!looksLikeHtmlDocument(value)) {
+    return false;
+  }
+
+  const normalized = value.toLowerCase();
+  return (
+    normalized.includes('sign in')
+    || normalized.includes('signin')
+    || normalized.includes('log in')
+    || normalized.includes('login')
+    || normalized.includes('password')
+  );
+}
+
+function extractPaperclipApiErrorMessageFromText(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  try {
+    return extractPaperclipApiErrorMessage(JSON.parse(trimmed)) ?? undefined;
+  } catch {
+    if (looksLikeHtmlDocument(trimmed)) {
+      return undefined;
+    }
+
+    return trimmed;
+  }
+}
+
+function buildUnexpectedPaperclipApiPayloadFailure(
+  response: Response,
+  operationLabel: string,
+  bodyText: string
+): PaperclipApiOperationFailure {
+  const contentType = response.headers.get('content-type')?.trim();
+  const looksLikeLogin = looksLikeLoginHtmlDocument(bodyText);
+  const looksLikeHtml = looksLikeHtmlDocument(bodyText);
+
+  let errorMessage: string;
+  if (looksLikeLogin) {
+    errorMessage = `Expected JSON from the Paperclip ${operationLabel} API but received an HTML sign-in page.`;
+  } else if (looksLikeHtml) {
+    errorMessage = `Expected JSON from the Paperclip ${operationLabel} API but received HTML.`;
+  } else if (contentType) {
+    errorMessage = `Expected JSON from the Paperclip ${operationLabel} API but received ${contentType}.`;
+  } else {
+    errorMessage = `Expected JSON from the Paperclip ${operationLabel} API but received an unreadable payload.`;
+  }
+
+  return {
+    status: response.status,
+    errorMessage,
+    requiresAuthentication:
+      response.status === 401
+      || response.status === 403
+      || response.redirected
+      || looksLikeLogin
+  };
+}
+
+async function readPaperclipApiJsonResponse<T>(
+  response: Response,
+  options: {
+    operationLabel: string;
+    bodyRequired?: boolean;
+  }
+): Promise<PaperclipApiJsonReadResult<T>> {
+  const text = await response.text().catch(() => '');
+  const trimmed = text.trim();
+
+  if (!response.ok) {
+    return {
+      failure: {
+        status: response.status,
+        errorMessage:
+          extractPaperclipApiErrorMessageFromText(trimmed)
+          ?? (response.status === 401 || response.status === 403 ? 'Paperclip API authentication failed.' : undefined)
+          ?? (response.statusText.trim() || undefined),
+        requiresAuthentication:
+          response.status === 401
+          || response.status === 403
+          || response.redirected
+          || looksLikeLoginHtmlDocument(trimmed)
+      }
+    };
+  }
+
+  if (!trimmed) {
+    if (options.bodyRequired ?? true) {
+      return {
+        failure: {
+          status: response.status,
+          errorMessage: `The Paperclip ${options.operationLabel} API responded successfully but did not return the expected JSON payload.`
+        }
+      };
+    }
+
+    return {};
+  }
+
+  const contentType = response.headers.get('content-type');
+  if (contentType && !isJsonContentType(contentType)) {
+    return {
+      failure: buildUnexpectedPaperclipApiPayloadFailure(response, options.operationLabel, trimmed)
+    };
+  }
+
+  try {
+    return {
+      data: JSON.parse(trimmed) as T
+    };
+  } catch {
+    return {
+      failure: buildUnexpectedPaperclipApiPayloadFailure(response, options.operationLabel, trimmed)
+    };
+  }
 }
 
 type IssueDescriptionUpdatePath = 'local_api' | 'sdk';
@@ -3871,19 +4255,19 @@ function logPaperclipLabelCreateFailure(
     paperclipApiBaseUrl?: string;
     labelName: string;
     color: string;
-    status?: number;
-    errorMessage?: string;
+    failure?: PaperclipApiOperationFailure;
   }
 ) {
-  const { companyId, paperclipApiBaseUrl, labelName, color, status, errorMessage } = params;
+  const { companyId, paperclipApiBaseUrl, labelName, color, failure } = params;
 
   ctx.logger.warn('Unable to create a Paperclip label through the local API.', {
     companyId,
     paperclipApiBaseUrl,
     labelName,
     color,
-    ...(status !== undefined ? { status } : {}),
-    ...(errorMessage ? { error: errorMessage } : {})
+    ...(failure?.status !== undefined ? { status: failure.status } : {}),
+    ...(failure?.errorMessage ? { error: failure.errorMessage } : {}),
+    ...(failure?.requiresAuthentication ? { requiresAuthentication: true } : {})
   });
 }
 
@@ -4018,33 +4402,56 @@ async function listPaperclipLabelsViaApi(
   ctx: PluginSetupContext,
   companyId: string,
   paperclipApiBaseUrl?: string
-): Promise<PaperclipLabelDirectory | null> {
+): Promise<PaperclipLabelLookupResult> {
   if (!paperclipApiBaseUrl) {
-    return null;
+    return {
+      directory: null
+    };
   }
 
   try {
-    const response = await fetchPaperclipApi(getPaperclipLabelsEndpoint(paperclipApiBaseUrl, companyId), {
-      method: 'GET',
-      headers: {
-        accept: 'application/json'
+    const response = await fetchPaperclipApi(
+      getPaperclipLabelsEndpoint(paperclipApiBaseUrl, companyId),
+      {
+        method: 'GET',
+        headers: {
+          accept: 'application/json'
+        }
+      },
+      {
+        companyId
       }
+    );
+
+    const payloadResult = await readPaperclipApiJsonResponse<unknown>(response, {
+      operationLabel: 'label list'
     });
 
-    if (!response.ok) {
-      if (response.status !== 404 && response.status !== 405) {
+    if (payloadResult.failure) {
+      if (payloadResult.failure.status !== 404 && payloadResult.failure.status !== 405) {
         ctx.logger.warn('Unable to list Paperclip labels through the local API.', {
           companyId,
           paperclipApiBaseUrl,
-          status: response.status
+          ...(payloadResult.failure.status !== undefined ? { status: payloadResult.failure.status } : {}),
+          ...(payloadResult.failure.errorMessage ? { error: payloadResult.failure.errorMessage } : {}),
+          ...(payloadResult.failure.requiresAuthentication ? { requiresAuthentication: true } : {})
         });
       }
-      return null;
+      return {
+        directory: null,
+        failure: payloadResult.failure
+      };
     }
 
-    const payload = await response.json();
+    const payload = payloadResult.data;
     if (!Array.isArray(payload)) {
-      return null;
+      return {
+        directory: null,
+        failure: {
+          status: response.status,
+          errorMessage: 'The Paperclip label API returned an unreadable label payload.'
+        }
+      };
     }
 
     const directory: PaperclipLabelDirectory = new Map();
@@ -4055,14 +4462,21 @@ async function listPaperclipLabelsViaApi(
       }
     }
 
-    return directory;
+    return {
+      directory
+    };
   } catch (error) {
     ctx.logger.warn('Unable to list Paperclip labels through the local API.', {
       companyId,
       paperclipApiBaseUrl,
       error: error instanceof Error ? error.message : String(error)
     });
-    return null;
+    return {
+      directory: null,
+      failure: {
+        errorMessage: error instanceof Error ? error.message : String(error)
+      }
+    };
   }
 }
 
@@ -4073,8 +4487,8 @@ async function buildPaperclipLabelDirectory(
 ): Promise<PaperclipLabelDirectory> {
   const directory: PaperclipLabelDirectory = new Map();
   const apiDirectory = await listPaperclipLabelsViaApi(ctx, companyId, paperclipApiBaseUrl);
-  if (apiDirectory) {
-    mergePaperclipLabelDirectories(directory, apiDirectory);
+  if (apiDirectory.directory) {
+    mergePaperclipLabelDirectories(directory, apiDirectory.directory);
   }
 
   if (!ctx.issues || typeof ctx.issues.list !== 'function') {
@@ -4123,43 +4537,55 @@ async function createPaperclipLabelViaApi(
   const color = normalizeHexColor(githubLabel.color) ?? DEFAULT_PAPERCLIP_LABEL_COLOR;
 
   try {
-    const response = await fetchPaperclipApi(getPaperclipLabelsEndpoint(paperclipApiBaseUrl, companyId), {
-      method: 'POST',
-      headers: {
-        accept: 'application/json',
-        'content-type': 'application/json'
+    const response = await fetchPaperclipApi(
+      getPaperclipLabelsEndpoint(paperclipApiBaseUrl, companyId),
+      {
+        method: 'POST',
+        headers: {
+          accept: 'application/json',
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          name: githubLabel.name,
+          color
+        })
       },
-      body: JSON.stringify({
-        name: githubLabel.name,
-        color
-      })
+      {
+        companyId
+      }
+    );
+
+    const payloadResult = await readPaperclipApiJsonResponse<unknown>(response, {
+      operationLabel: 'label create'
     });
 
-    if (!response.ok) {
+    if (payloadResult.failure) {
       return {
         label: null,
-        status: response.status,
-        errorMessage: await readPaperclipApiErrorMessage(response)
+        failure: payloadResult.failure
       };
     }
 
-    const createdLabel = parsePaperclipIssueLabel(await response.json(), companyId);
+    const createdLabel = parsePaperclipIssueLabel(payloadResult.data, companyId);
     if (!createdLabel) {
       return {
         label: null,
-        status: response.status,
-        errorMessage: 'The Paperclip label API returned an unreadable label payload.'
+        failure: {
+          status: response.status,
+          errorMessage: 'The Paperclip label API returned an unreadable label payload.'
+        }
       };
     }
 
     return {
-      label: createdLabel,
-      status: response.status
+      label: createdLabel
     };
   } catch (error) {
     return {
       label: null,
-      errorMessage: error instanceof Error ? error.message : String(error)
+      failure: {
+        errorMessage: error instanceof Error ? error.message : String(error)
+      }
     };
   }
 }
@@ -4170,50 +4596,61 @@ async function ensurePaperclipLabelForGitHubLabel(
   githubLabel: GitHubIssueLabelRecord,
   directory: PaperclipLabelDirectory,
   paperclipApiBaseUrl?: string
-): Promise<PaperclipIssueLabel | null> {
+): Promise<ResolvedPaperclipLabelResult> {
   const matchedBeforeCreate = selectPaperclipLabelForGitHubLabel(githubLabel, directory);
   if (matchedBeforeCreate) {
-    return matchedBeforeCreate;
+    return {
+      label: matchedBeforeCreate
+    };
   }
 
   const refreshedDirectoryBeforeCreate = await listPaperclipLabelsViaApi(ctx, companyId, paperclipApiBaseUrl);
-  if (refreshedDirectoryBeforeCreate) {
-    mergePaperclipLabelDirectories(directory, refreshedDirectoryBeforeCreate);
+  if (refreshedDirectoryBeforeCreate.directory) {
+    mergePaperclipLabelDirectories(directory, refreshedDirectoryBeforeCreate.directory);
   }
 
   const matchedAfterRefresh = selectPaperclipLabelForGitHubLabel(githubLabel, directory);
   if (matchedAfterRefresh) {
-    return matchedAfterRefresh;
+    return {
+      label: matchedAfterRefresh
+    };
   }
 
   const creationAttempt = await createPaperclipLabelViaApi(ctx, companyId, githubLabel, paperclipApiBaseUrl);
   if (creationAttempt.label) {
     addPaperclipLabelToDirectory(directory, creationAttempt.label);
-    return creationAttempt.label;
+    return {
+      label: creationAttempt.label
+    };
   }
 
   const refreshedDirectory = await listPaperclipLabelsViaApi(ctx, companyId, paperclipApiBaseUrl);
-  if (refreshedDirectory) {
-    mergePaperclipLabelDirectories(directory, refreshedDirectory);
+  if (refreshedDirectory.directory) {
+    mergePaperclipLabelDirectories(directory, refreshedDirectory.directory);
   }
 
   const matchedAfterCreateFailure = selectPaperclipLabelForGitHubLabel(githubLabel, directory);
   if (matchedAfterCreateFailure) {
-    return matchedAfterCreateFailure;
+    return {
+      label: matchedAfterCreateFailure
+    };
   }
 
-  if (creationAttempt.status !== undefined || creationAttempt.errorMessage) {
+  const failure = creationAttempt.failure ?? refreshedDirectory.failure ?? refreshedDirectoryBeforeCreate.failure;
+  if (failure?.status !== undefined || failure?.errorMessage) {
     logPaperclipLabelCreateFailure(ctx, {
       companyId,
       paperclipApiBaseUrl,
       labelName: githubLabel.name,
       color: normalizeHexColor(githubLabel.color) ?? DEFAULT_PAPERCLIP_LABEL_COLOR,
-      status: creationAttempt.status,
-      errorMessage: creationAttempt.errorMessage
+      failure
     });
   }
 
-  return null;
+  return {
+    label: null,
+    ...(failure ? { failure } : {})
+  };
 }
 
 async function ensurePaperclipLabelsForIssue(
@@ -4222,12 +4659,14 @@ async function ensurePaperclipLabelsForIssue(
   issue: GitHubIssueRecord,
   directory: PaperclipLabelDirectory,
   paperclipApiBaseUrl?: string
-): Promise<PaperclipIssueLabel[]> {
+): Promise<PaperclipIssueLabelResolutionResult> {
   const matchedLabels: PaperclipIssueLabel[] = [];
+  const unresolvedGitHubLabels: GitHubIssueLabelRecord[] = [];
   const seenIds = new Set<string>();
+  let failure: PaperclipApiOperationFailure | undefined;
 
   for (const githubLabel of issue.labels) {
-    const selectedLabel = await ensurePaperclipLabelForGitHubLabel(
+    const resolution = await ensurePaperclipLabelForGitHubLabel(
       ctx,
       companyId,
       githubLabel,
@@ -4235,15 +4674,25 @@ async function ensurePaperclipLabelsForIssue(
       paperclipApiBaseUrl
     );
 
-    if (!selectedLabel || seenIds.has(selectedLabel.id)) {
+    if (!resolution.label) {
+      unresolvedGitHubLabels.push(githubLabel);
+      failure ??= resolution.failure;
       continue;
     }
 
-    seenIds.add(selectedLabel.id);
-    matchedLabels.push(selectedLabel);
+    if (seenIds.has(resolution.label.id)) {
+      continue;
+    }
+
+    seenIds.add(resolution.label.id);
+    matchedLabels.push(resolution.label);
   }
 
-  return matchedLabels;
+  return {
+    labels: matchedLabels,
+    unresolvedGitHubLabels,
+    ...(failure ? { failure } : {})
+  };
 }
 
 async function applyPaperclipLabelsToIssue(
@@ -4298,13 +4747,23 @@ async function synchronizePaperclipIssueLabels(
   availableLabels: PaperclipLabelDirectory,
   paperclipApiBaseUrl?: string
 ): Promise<boolean> {
-  const nextLabels = await ensurePaperclipLabelsForIssue(
+  const labelResolution = await ensurePaperclipLabelsForIssue(
     ctx,
     companyId,
     githubIssue,
     availableLabels,
     paperclipApiBaseUrl
   );
+
+  if (labelResolution.unresolvedGitHubLabels.length > 0) {
+    throw new PaperclipLabelSyncError({
+      labelNames: labelResolution.unresolvedGitHubLabels.map((label) => label.name),
+      paperclipApiBaseUrl,
+      failure: labelResolution.failure
+    });
+  }
+
+  const nextLabels = labelResolution.labels;
 
   if (doPaperclipIssueLabelsMatch(paperclipIssue, nextLabels)) {
     return false;
@@ -4369,25 +4828,30 @@ async function synchronizePaperclipIssueDescription(
 
   if (paperclipApiBaseUrl) {
     try {
-      const response = await fetchPaperclipApi(getPaperclipIssueEndpoint(paperclipApiBaseUrl, issueId), {
-        method: 'PATCH',
-        headers: {
-          accept: 'application/json',
-          'content-type': 'application/json'
+      const response = await fetchPaperclipApi(
+        getPaperclipIssueEndpoint(paperclipApiBaseUrl, issueId),
+        {
+          method: 'PATCH',
+          headers: {
+            accept: 'application/json',
+            'content-type': 'application/json'
+          },
+          body: JSON.stringify({
+            description: nextDescription
+          })
         },
-        body: JSON.stringify({
-          description: nextDescription
-        })
+        {
+          companyId
+        }
+      );
+
+      const payloadResult = await readPaperclipApiJsonResponse<unknown>(response, {
+        operationLabel: 'issue update',
+        bodyRequired: false
       });
 
-      if (response.ok) {
-        let updatedDescription: string | null | undefined;
-        try {
-          updatedDescription = parsePaperclipIssueDescription(await response.json());
-        } catch {
-          updatedDescription = undefined;
-        }
-
+      if (!payloadResult.failure) {
+        const updatedDescription = parsePaperclipIssueDescription(payloadResult.data);
         if (updatedDescription === undefined || updatedDescription === nextDescription) {
           if (resolvedDiagnosticReason) {
             logIssueDescriptionDiagnostic(ctx, 'info', 'GitHub sync repaired a Paperclip issue description through the local Paperclip API.', {
@@ -4418,7 +4882,7 @@ async function synchronizePaperclipIssueDescription(
         });
       }
 
-      if (response.status !== 404 && response.status !== 405) {
+      if ((payloadResult.failure?.status ?? response.status) !== 404 && (payloadResult.failure?.status ?? response.status) !== 405) {
         logPaperclipIssueDescriptionUpdateFailure(ctx, {
           companyId,
           issueId,
@@ -4429,8 +4893,8 @@ async function synchronizePaperclipIssueDescription(
           nextDescription,
           reason: resolvedDiagnosticReason,
           updatePath: 'local_api',
-          status: response.status,
-          errorMessage: await readPaperclipApiErrorMessage(response)
+          status: payloadResult.failure?.status ?? response.status,
+          errorMessage: payloadResult.failure?.errorMessage
         });
       }
     } catch (error) {
@@ -4495,29 +4959,40 @@ async function updatePaperclipIssueStatus(
 
   if (paperclipApiBaseUrl) {
     try {
-      const response = await fetchPaperclipApi(getPaperclipIssueEndpoint(paperclipApiBaseUrl, issueId), {
-        method: 'PATCH',
-        headers: {
-          accept: 'application/json',
-          'content-type': 'application/json'
+      const response = await fetchPaperclipApi(
+        getPaperclipIssueEndpoint(paperclipApiBaseUrl, issueId),
+        {
+          method: 'PATCH',
+          headers: {
+            accept: 'application/json',
+            'content-type': 'application/json'
+          },
+          body: JSON.stringify({
+            status: nextStatus
+          })
         },
-        body: JSON.stringify({
-          status: nextStatus
-        })
+        {
+          companyId
+        }
+      );
+
+      const payloadResult = await readPaperclipApiJsonResponse<unknown>(response, {
+        operationLabel: 'issue update',
+        bodyRequired: false
       });
 
-      if (response.ok) {
+      if (!payloadResult.failure) {
         statusUpdated = true;
       }
 
-      if (!response.ok && response.status !== 404 && response.status !== 405) {
+      if (payloadResult.failure && (payloadResult.failure.status ?? response.status) !== 404 && (payloadResult.failure.status ?? response.status) !== 405) {
         logPaperclipIssueStatusUpdateFailure(ctx, {
           companyId,
           issueId,
           paperclipApiBaseUrl,
           nextStatus,
-          status: response.status,
-          errorMessage: await readPaperclipApiErrorMessage(response)
+          status: payloadResult.failure.status ?? response.status,
+          errorMessage: payloadResult.failure.errorMessage
         });
       }
     } catch (error) {
@@ -4606,8 +5081,9 @@ async function createPaperclipIssue(
   mapping: RepositoryMapping,
   issue: GitHubIssueRecord,
   availableLabels: PaperclipLabelDirectory,
-  paperclipApiBaseUrl: string | undefined
-): Promise<Pick<Issue, 'id'>> {
+  paperclipApiBaseUrl: string | undefined,
+  syncFailureContext?: SyncFailureContext
+): Promise<PaperclipIssueCreateResult> {
   if (!mapping.companyId || !mapping.paperclipProjectId) {
     throw new Error(`Mapping ${mapping.id} is missing resolved Paperclip project identifiers.`);
   }
@@ -4620,21 +5096,31 @@ async function createPaperclipIssue(
 
   if (paperclipApiBaseUrl) {
     try {
-      const response = await fetchPaperclipApi(getPaperclipIssuesEndpoint(paperclipApiBaseUrl, mapping.companyId), {
-        method: 'POST',
-        headers: {
-          accept: 'application/json',
-          'content-type': 'application/json'
+      const response = await fetchPaperclipApi(
+        getPaperclipIssuesEndpoint(paperclipApiBaseUrl, mapping.companyId),
+        {
+          method: 'POST',
+          headers: {
+            accept: 'application/json',
+            'content-type': 'application/json'
+          },
+          body: JSON.stringify({
+            projectId: mapping.paperclipProjectId,
+            title,
+            ...(description ? { description } : {})
+          })
         },
-        body: JSON.stringify({
-          projectId: mapping.paperclipProjectId,
-          title,
-          ...(description ? { description } : {})
-        })
+        {
+          companyId: mapping.companyId
+        }
+      );
+
+      const payloadResult = await readPaperclipApiJsonResponse<unknown>(response, {
+        operationLabel: 'issue create'
       });
 
-      if (response.ok) {
-        const createdIssue = await response.json();
+      if (!payloadResult.failure) {
+        const createdIssue = payloadResult.data;
         createdIssueId = parsePaperclipIssueId(createdIssue);
         createdIssueDescription = parsePaperclipIssueDescription(createdIssue);
         createPath = 'local_api';
@@ -4690,15 +5176,32 @@ async function createPaperclipIssue(
 
   await upsertGitHubIssueLinkRecord(ctx, mapping, createdIssueId, issue, []);
 
+  if (syncFailureContext) {
+    updateSyncFailureContext(syncFailureContext, {
+      phase: 'syncing_labels',
+      repositoryUrl: mapping.repositoryUrl,
+      githubIssueNumber: issue.number
+    });
+  }
+
+  const labelResolution = await ensurePaperclipLabelsForIssue(
+    ctx,
+    mapping.companyId,
+    issue,
+    availableLabels,
+    paperclipApiBaseUrl
+  );
   await applyPaperclipLabelsToIssue(
     ctx,
     mapping.companyId,
     createdIssueId,
-    await ensurePaperclipLabelsForIssue(ctx, mapping.companyId, issue, availableLabels, paperclipApiBaseUrl)
+    labelResolution.labels
   );
 
   return {
-    id: createdIssueId
+    id: createdIssueId,
+    unresolvedGitHubLabels: labelResolution.unresolvedGitHubLabels,
+    ...(labelResolution.failure ? { labelResolutionFailure: labelResolution.failure } : {})
   };
 }
 
@@ -4767,7 +5270,8 @@ async function ensurePaperclipIssueImported(
     mapping,
     issue,
     availableLabels,
-    paperclipApiBaseUrl
+    paperclipApiBaseUrl,
+    syncFailureContext
   );
   const registryRecord = upsertImportedIssueRecord(
     nextRegistry,
@@ -4776,6 +5280,15 @@ async function ensurePaperclipIssueImported(
   importRegistryByIssueId.set(issue.id, registryRecord);
   ensuredPaperclipIssueIds.set(issue.id, createdIssue.id);
   createdIssueIds.add(issue.id);
+
+  if (createdIssue.unresolvedGitHubLabels.length > 0) {
+    throw new PaperclipLabelSyncError({
+      labelNames: createdIssue.unresolvedGitHubLabels.map((label) => label.name),
+      paperclipApiBaseUrl,
+      failure: createdIssue.labelResolutionFailure
+    });
+  }
+
   return createdIssue.id;
 }
 
@@ -5025,6 +5538,108 @@ function hasConfiguredGithubToken(
   return Boolean(getConfiguredGithubTokenRef(settings, config));
 }
 
+function getSavedPaperclipBoardApiTokenRef(
+  settings: Pick<GitHubSyncSettings, 'paperclipBoardApiTokenRefs'> | null | undefined,
+  companyId?: string
+): string | undefined {
+  if (!companyId) {
+    return undefined;
+  }
+
+  return normalizeSecretRef(settings?.paperclipBoardApiTokenRefs?.[companyId]);
+}
+
+function getConfiguredPaperclipBoardApiTokenRef(
+  config: Pick<GitHubSyncConfig, 'paperclipBoardApiTokenRefs'> | null | undefined,
+  companyId?: string
+): string | undefined {
+  if (!companyId) {
+    return undefined;
+  }
+
+  return normalizeSecretRef(config?.paperclipBoardApiTokenRefs?.[companyId]);
+}
+
+function hasConfiguredPaperclipBoardAccess(
+  settings: Pick<GitHubSyncSettings, 'paperclipBoardApiTokenRefs'> | null | undefined,
+  config: Pick<GitHubSyncConfig, 'paperclipBoardApiTokenRefs'> | null | undefined,
+  companyId?: string
+): boolean {
+  if (companyId) {
+    return Boolean(
+      getConfiguredPaperclipBoardApiTokenRef(config, companyId)
+      ?? getSavedPaperclipBoardApiTokenRef(settings, companyId)
+    );
+  }
+
+  return Boolean(
+    (settings?.paperclipBoardApiTokenRefs && Object.keys(settings.paperclipBoardApiTokenRefs).length > 0)
+    || (config?.paperclipBoardApiTokenRefs && Object.keys(config.paperclipBoardApiTokenRefs).length > 0)
+  );
+}
+
+function getMappingsMissingPaperclipBoardAccess(
+  settings: Pick<GitHubSyncSettings, 'paperclipBoardApiTokenRefs'> | null | undefined,
+  config: Pick<GitHubSyncConfig, 'paperclipBoardApiTokenRefs'> | null | undefined,
+  mappings: RepositoryMapping[]
+): RepositoryMapping[] {
+  return mappings.filter((mapping) => {
+    const companyId = normalizeCompanyId(mapping.companyId);
+    return Boolean(companyId && !hasConfiguredPaperclipBoardAccess(settings, config, companyId));
+  });
+}
+
+async function resolvePaperclipApiAuthTokens(
+  ctx: PluginSetupContext,
+  settings: Pick<GitHubSyncSettings, 'paperclipBoardApiTokenRefs'>,
+  config: Pick<GitHubSyncConfig, 'paperclipBoardApiTokenRefs'>,
+  mappings: RepositoryMapping[]
+): Promise<Map<string, string>> {
+  const companyIds = [
+    ...new Set(
+      mappings
+        .map((mapping) => normalizeCompanyId(mapping.companyId))
+        .filter((companyId): companyId is string => Boolean(companyId))
+    )
+  ];
+  const tokensByCompanyId = new Map<string, string>();
+
+  for (const companyId of companyIds) {
+    const configuredSecretRef = getConfiguredPaperclipBoardApiTokenRef(config, companyId);
+    const savedSecretRef = getSavedPaperclipBoardApiTokenRef(settings, companyId);
+    const secretRef = configuredSecretRef ?? savedSecretRef;
+    if (!secretRef) {
+      continue;
+    }
+
+    if (!configuredSecretRef && savedSecretRef) {
+      ctx.logger.warn(
+        'Paperclip board access is saved in plugin state but has not been mirrored into plugin config yet. Open plugin settings to finish migrating it, or reconnect board access, before retrying sync.',
+        {
+          companyId,
+          secretRef: savedSecretRef
+        }
+      );
+      continue;
+    }
+
+    try {
+      const token = (await ctx.secrets.resolve(secretRef)).trim();
+      if (token) {
+        tokensByCompanyId.set(companyId, token);
+      }
+    } catch (error) {
+      ctx.logger.warn('Unable to resolve the saved Paperclip board API token. Direct REST calls will continue without it.', {
+        companyId,
+        secretRef,
+        error: getErrorMessage(error)
+      });
+    }
+  }
+
+  return tokensByCompanyId;
+}
+
 async function resolveGithubToken(ctx: PluginSetupContext): Promise<string> {
   const settings = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
   const config = await getResolvedConfig(ctx);
@@ -5089,9 +5704,11 @@ async function performSync(
   } = {}
 ) {
   const settings = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
+  const config = await getResolvedConfig(ctx);
   const importRegistry = normalizeImportRegistry(await ctx.state.get(IMPORT_REGISTRY_SCOPE));
   const token = typeof options.resolvedToken === 'string' ? options.resolvedToken : await resolveGithubToken(ctx);
   const mappings = getSyncableMappingsForTarget(settings.mappings, options.target);
+  activePaperclipApiAuthTokensByCompanyId = null;
   const failureContext: SyncFailureContext = {
     phase: 'configuration'
   };
@@ -5110,6 +5727,20 @@ async function performSync(
     const next = {
       ...settings,
       syncState: createSetupConfigurationErrorSyncState('missing_mapping', trigger)
+    };
+    await ctx.state.set(SETTINGS_SCOPE, next);
+    await ctx.state.set(SYNC_STATE_SCOPE, next.syncState);
+    return next;
+  }
+
+  const mappingsMissingBoardAccess = getMappingsMissingPaperclipBoardAccess(settings, config, mappings);
+  if (
+    mappingsMissingBoardAccess.length > 0
+    && await detectPaperclipBoardAccessRequirement(settings.paperclipApiBaseUrl)
+  ) {
+    const next = {
+      ...settings,
+      syncState: createSetupConfigurationErrorSyncState('missing_board_access', trigger)
     };
     await ctx.state.set(SETTINGS_SCOPE, next);
     await ctx.state.set(SYNC_STATE_SCOPE, next.syncState);
@@ -5136,6 +5767,8 @@ async function performSync(
     await ctx.state.set(SYNC_STATE_SCOPE, next.syncState);
     return next;
   }
+
+  activePaperclipApiAuthTokensByCompanyId = await resolvePaperclipApiAuthTokens(ctx, settings, config, mappings);
 
   const octokit = new Octokit({ auth: token });
   let syncedIssuesCount = 0;
@@ -5677,6 +6310,7 @@ async function startSync(
     } catch (error) {
       return await createUnexpectedSyncErrorResult(ctx, trigger, error);
     } finally {
+      activePaperclipApiAuthTokensByCompanyId = null;
       activeRunningSyncState = null;
       activeSyncPromise = null;
     }
@@ -5708,12 +6342,16 @@ async function startSync(
 
 const plugin = definePlugin({
   async setup(ctx) {
-    ctx.data.register('settings.registration', async () => {
+    ctx.data.register('settings.registration', async (input) => {
+      const record = input && typeof input === 'object' ? input as Record<string, unknown> : {};
+      const requestedCompanyId = normalizeCompanyId(record.companyId);
       const saved = await ctx.state.get(SETTINGS_SCOPE);
       const importRegistry = normalizeImportRegistry(await ctx.state.get(IMPORT_REGISTRY_SCOPE));
       const normalizedSettings = normalizeSettings(saved);
       const config = await getResolvedConfig(ctx);
       const githubTokenRef = getConfiguredGithubTokenRef(normalizedSettings, config);
+      const configuredBoardTokenRef = getConfiguredPaperclipBoardApiTokenRef(config, requestedCompanyId);
+      const savedBoardTokenRef = getSavedPaperclipBoardApiTokenRef(normalizedSettings, requestedCompanyId);
       const settingsWithResolvedToken = githubTokenRef === normalizedSettings.githubTokenRef
         ? normalizedSettings
         : {
@@ -5733,7 +6371,10 @@ const plugin = definePlugin({
       return {
         ...getPublicSettings(settingsForResponse),
         totalSyncedIssuesCount: countImportedIssuesForMappings(importRegistry, settingsForResponse.mappings),
-        githubTokenConfigured
+        githubTokenConfigured,
+        paperclipBoardAccessConfigured: hasConfiguredPaperclipBoardAccess(settingsForResponse, config, requestedCompanyId),
+        ...(savedBoardTokenRef ? { paperclipBoardAccessConfigSyncRef: savedBoardTokenRef } : {}),
+        paperclipBoardAccessNeedsConfigSync: Boolean(savedBoardTokenRef && !configuredBoardTokenRef)
       };
     });
 
@@ -5770,6 +6411,7 @@ const plugin = definePlugin({
         syncState: previous.syncState,
         scheduleFrequencyMinutes: 'scheduleFrequencyMinutes' in record ? record.scheduleFrequencyMinutes : previous.scheduleFrequencyMinutes,
         paperclipApiBaseUrl: 'paperclipApiBaseUrl' in record ? record.paperclipApiBaseUrl : previous.paperclipApiBaseUrl,
+        paperclipBoardApiTokenRefs: previous.paperclipBoardApiTokenRefs,
         ...(githubTokenRef ? { githubTokenRef } : {})
       });
       const nextMappings = current.mappings.map((mapping, index) => ({
@@ -5784,6 +6426,7 @@ const plugin = definePlugin({
         syncState: previous.syncState,
         scheduleFrequencyMinutes: current.scheduleFrequencyMinutes,
         ...(current.paperclipApiBaseUrl ? { paperclipApiBaseUrl: current.paperclipApiBaseUrl } : {}),
+        ...(current.paperclipBoardApiTokenRefs ? { paperclipBoardApiTokenRefs: current.paperclipBoardApiTokenRefs } : {}),
         ...(githubTokenRef ? { githubTokenRef } : {}),
         updatedAt: new Date().toISOString()
       }, {
@@ -5794,6 +6437,50 @@ const plugin = definePlugin({
       await ctx.state.set(SETTINGS_SCOPE, next);
       await ctx.state.set(SYNC_STATE_SCOPE, next.syncState);
       return getPublicSettings(next);
+    });
+
+    ctx.actions.register('settings.updateBoardAccess', async (input) => {
+      const previous = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
+      const config = await getResolvedConfig(ctx);
+      const record = input && typeof input === 'object' ? input as Record<string, unknown> : {};
+      const companyId = normalizeCompanyId(record.companyId);
+      if (!companyId) {
+        throw new Error('A company id is required to update Paperclip board access.');
+      }
+
+      const nextSecretRef = normalizeSecretRef(record.paperclipBoardApiTokenRef);
+      const nextPaperclipBoardApiTokenRefs = {
+        ...(previous.paperclipBoardApiTokenRefs ?? {})
+      };
+
+      if (nextSecretRef) {
+        nextPaperclipBoardApiTokenRefs[companyId] = nextSecretRef;
+      } else {
+        delete nextPaperclipBoardApiTokenRefs[companyId];
+      }
+
+      const {
+        paperclipBoardApiTokenRefs: _previousPaperclipBoardApiTokenRefs,
+        ...previousWithoutBoardAccess
+      } = previous;
+      const next = sanitizeSettingsForCurrentSetup({
+        ...previousWithoutBoardAccess,
+        ...(Object.keys(nextPaperclipBoardApiTokenRefs).length > 0
+          ? { paperclipBoardApiTokenRefs: nextPaperclipBoardApiTokenRefs }
+          : {}),
+        updatedAt: new Date().toISOString()
+      }, {
+        hasToken: hasConfiguredGithubToken(previous, config),
+        hasMappings: getSyncableMappings(previous.mappings).length > 0
+      });
+
+      await ctx.state.set(SETTINGS_SCOPE, next);
+      await ctx.state.set(SYNC_STATE_SCOPE, next.syncState);
+
+      return {
+        ...getPublicSettings(next),
+        paperclipBoardAccessConfigured: hasConfiguredPaperclipBoardAccess(next, config, companyId)
+      };
     });
 
     ctx.actions.register('settings.validateToken', async (input) => {

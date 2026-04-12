@@ -1,6 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useHostContext, usePluginAction, usePluginData, usePluginToast } from '@paperclipai/plugin-sdk/ui';
 
+import { requiresPaperclipBoardAccess } from '../paperclip-health.ts';
+import { buildPaperclipUrl, fetchJson, fetchPaperclipHealth, resolveCliAuthPollUrl } from './http.ts';
+import { mergePluginConfig, normalizePluginConfig } from './plugin-config.ts';
+
 const HOST_BUTTON_BASE_CLASSNAME = [
   'inline-flex items-center justify-center whitespace-nowrap text-sm font-medium',
   'transition-[color,background-color,border-color,box-shadow,opacity]',
@@ -78,7 +82,7 @@ interface SyncRunState {
 }
 
 type SyncProgressPhase = 'preparing' | 'importing' | 'syncing';
-type SyncConfigurationIssue = 'missing_token' | 'missing_mapping';
+type SyncConfigurationIssue = 'missing_token' | 'missing_mapping' | 'missing_board_access';
 
 interface SyncProgressState {
   phase?: SyncProgressPhase;
@@ -119,6 +123,9 @@ interface GitHubSyncSettings {
   scheduleFrequencyMinutes: number;
   paperclipApiBaseUrl?: string;
   githubTokenConfigured?: boolean;
+  paperclipBoardAccessConfigured?: boolean;
+  paperclipBoardAccessNeedsConfigSync?: boolean;
+  paperclipBoardAccessConfigSyncRef?: string;
   totalSyncedIssuesCount?: number;
   updatedAt?: string;
 }
@@ -172,6 +179,39 @@ interface TokenValidationResult {
   login: string;
 }
 
+interface CliAuthChallengeResponse {
+  token?: string;
+  boardApiToken?: string;
+  approvalUrl?: string;
+  approvalPath?: string;
+  pollUrl?: string;
+  pollPath?: string;
+  expiresAt?: string;
+  suggestedPollIntervalMs?: number;
+}
+
+interface CliAuthChallengePollResponse {
+  status?: string;
+  boardApiToken?: string;
+}
+
+interface CliAuthIdentityResponse {
+  login?: string | null;
+  email?: string | null;
+  displayName?: string | null;
+  name?: string | null;
+  user?: {
+    login?: string | null;
+    email?: string | null;
+    displayName?: string | null;
+    name?: string | null;
+  } | null;
+}
+
+interface PluginConfigResponse {
+  configJson?: Record<string, unknown> | null;
+}
+
 interface ParsedRepositoryReference {
   owner: string;
   repo: string;
@@ -181,6 +221,7 @@ interface ParsedRepositoryReference {
 type ThemeMode = 'light' | 'dark';
 type Tone = 'neutral' | 'success' | 'warning' | 'info' | 'danger';
 type TokenStatus = 'required' | 'valid' | 'invalid';
+type BoardAccessRequirementStatus = 'loading' | 'required' | 'not_required' | 'unknown';
 
 interface ThemePalette {
   text: string;
@@ -292,11 +333,18 @@ const DARK_PALETTE: ThemePalette = {
 
 const DEFAULT_SCHEDULE_FREQUENCY_MINUTES = 15;
 const SYNC_POLL_INTERVAL_MS = 750;
+const CLI_AUTH_POLL_INTERVAL_FALLBACK_MS = 1_000;
+const CLI_AUTH_POLL_INTERVAL_MIN_MS = 500;
+const CLI_AUTH_POLL_INTERVAL_MAX_MS = 5_000;
 const MISSING_GITHUB_TOKEN_SYNC_MESSAGE = 'Configure a GitHub token secret before running sync.';
 const MISSING_GITHUB_TOKEN_SYNC_ACTION = 'Open settings, add a GitHub token secret, validate it, and then run sync again.';
 const MISSING_MAPPING_SYNC_MESSAGE = 'Save at least one mapping with a created Paperclip project before running sync.';
 const MISSING_MAPPING_SYNC_ACTION =
   'Open settings, add a repository mapping, let Paperclip create the target project, and then retry sync.';
+const MISSING_BOARD_ACCESS_SYNC_MESSAGE =
+  'Connect Paperclip board access before running sync on this authenticated deployment.';
+const MISSING_BOARD_ACCESS_SYNC_ACTION =
+  'Open plugin settings for each mapped company that sync will touch, connect Paperclip board access, approve the flow, and then run sync again.';
 
 const EMPTY_SETTINGS: GitHubSyncSettings = {
   mappings: [],
@@ -328,6 +376,10 @@ function getLegacySyncConfigurationIssue(syncState: SyncRunState): SyncConfigura
     return 'missing_mapping';
   }
 
+  if (message === MISSING_BOARD_ACCESS_SYNC_MESSAGE || suggestedAction === MISSING_BOARD_ACCESS_SYNC_ACTION) {
+    return 'missing_board_access';
+  }
+
   return null;
 }
 
@@ -340,6 +392,7 @@ function getDisplaySyncState(
   setup: {
     hasToken: boolean;
     hasMappings: boolean;
+    hasBoardAccess: boolean;
   }
 ): SyncRunState {
   const configurationIssue = getSyncConfigurationIssue(syncState);
@@ -355,7 +408,85 @@ function getDisplaySyncState(
     return createIdleSyncState();
   }
 
+  if (configurationIssue === 'missing_board_access' && setup.hasBoardAccess) {
+    return createIdleSyncState();
+  }
+
   return syncState;
+}
+
+function getSyncSetupIssue(params: {
+  tokenStatus: TokenStatus;
+  savedMappingCount: number;
+  boardAccessRequired: boolean;
+  boardAccessConfigured: boolean;
+  hasCompanyContext: boolean;
+}): SyncConfigurationIssue | null {
+  if (params.tokenStatus !== 'valid') {
+    return 'missing_token';
+  }
+
+  if (params.savedMappingCount === 0) {
+    return 'missing_mapping';
+  }
+
+  if (params.boardAccessRequired && (!params.hasCompanyContext || !params.boardAccessConfigured)) {
+    return 'missing_board_access';
+  }
+
+  return null;
+}
+
+function getSyncSetupMessage(
+  issue: SyncConfigurationIssue | null,
+  hasCompanyContext: boolean
+): string {
+  switch (issue) {
+    case 'missing_token':
+      return 'Add a valid token to enable sync.';
+    case 'missing_mapping':
+      return 'Save a repository to enable sync.';
+    case 'missing_board_access':
+      return hasCompanyContext
+        ? 'Connect Paperclip board access to enable sync on this authenticated deployment.'
+        : 'Open plugin settings inside a company to connect required Paperclip board access.';
+    default:
+      return 'Ready to sync.';
+  }
+}
+
+function usePaperclipBoardAccessRequirement(): {
+  status: BoardAccessRequirementStatus;
+  required: boolean;
+} {
+  const [status, setStatus] = useState<BoardAccessRequirementStatus>('loading');
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void (async () => {
+      const health = await fetchPaperclipHealth();
+      if (cancelled) {
+        return;
+      }
+
+      if (!health) {
+        setStatus('unknown');
+        return;
+      }
+
+      setStatus(requiresPaperclipBoardAccess(health) ? 'required' : 'not_required');
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return {
+    status,
+    required: status === 'required'
+  };
 }
 
 function getGitHubRateLimitResourceLabel(resource?: string): string | null {
@@ -1925,26 +2056,6 @@ function useResolvedThemeMode(): ThemeMode {
   return themeMode;
 }
 
-async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
-    headers: {
-      'content-type': 'application/json',
-      ...(init?.headers ?? {})
-    },
-    credentials: 'same-origin',
-    ...init
-  });
-
-  const text = await response.text();
-  const body = text ? JSON.parse(text) : null;
-
-  if (!response.ok) {
-    throw new Error(`Paperclip API ${response.status}: ${text || response.statusText}`);
-  }
-
-  return body as T;
-}
-
 async function resolveOrCreateProject(companyId: string, projectName: string): Promise<{ id: string; name: string }> {
   const projects = await fetchJson<Array<{ id: string; name: string }>>(`/api/companies/${companyId}/projects`);
   const existing = projects.find((project) => project.name.trim().toLowerCase() === projectName.trim().toLowerCase());
@@ -1992,6 +2103,133 @@ async function resolveOrCreateCompanySecret(companyId: string, name: string, val
       value
     })
   });
+}
+
+async function patchPluginConfig(pluginId: string, patch: Record<string, unknown>): Promise<void> {
+  const currentConfigResponse = await fetchJson<PluginConfigResponse | null>(`/api/plugins/${pluginId}/config`);
+  const currentConfig = normalizePluginConfig(currentConfigResponse?.configJson);
+  const nextConfig = mergePluginConfig(currentConfig, patch);
+
+  await fetchJson(`/api/plugins/${pluginId}/config`, {
+    method: 'POST',
+    body: JSON.stringify({
+      configJson: nextConfig
+    })
+  });
+}
+
+function normalizeCliAuthPollIntervalMs(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    return CLI_AUTH_POLL_INTERVAL_FALLBACK_MS;
+  }
+
+  return Math.min(CLI_AUTH_POLL_INTERVAL_MAX_MS, Math.max(CLI_AUTH_POLL_INTERVAL_MIN_MS, Math.floor(value)));
+}
+
+function resolveCliAuthUrl(url?: string, path?: string): string | null {
+  if (typeof url === 'string' && url.trim()) {
+    return buildPaperclipUrl(url.trim());
+  }
+
+  if (typeof path !== 'string' || !path.trim()) {
+    return null;
+  }
+
+  return buildPaperclipUrl(path.trim());
+}
+
+function getCliAuthIdentityLabel(identity: CliAuthIdentityResponse): string | null {
+  const candidates = [
+    identity.user?.displayName,
+    identity.user?.name,
+    identity.user?.login,
+    identity.user?.email,
+    identity.displayName,
+    identity.name,
+    identity.login,
+    identity.email
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  return null;
+}
+
+function waitForDuration(durationMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    globalThis.setTimeout(resolve, durationMs);
+  });
+}
+
+async function requestBoardAccessChallenge(companyId: string): Promise<CliAuthChallengeResponse> {
+  return fetchJson<CliAuthChallengeResponse>('/api/cli-auth/challenges', {
+    method: 'POST',
+    body: JSON.stringify({
+      command: 'paperclip plugin github-sync settings',
+      clientName: 'GitHub Sync plugin',
+      requestedAccess: 'board',
+      requestedCompanyId: companyId
+    })
+  });
+}
+
+async function waitForBoardAccessApproval(challenge: CliAuthChallengeResponse): Promise<string> {
+  const challengeToken = typeof challenge.token === 'string' ? challenge.token.trim() : '';
+  const pollUrl = resolveCliAuthPollUrl(challenge.pollUrl ?? challenge.pollPath);
+  if (!challengeToken || !pollUrl) {
+    throw new Error('Paperclip did not return a usable board access challenge.');
+  }
+
+  const expiresAtTimeMs = typeof challenge.expiresAt === 'string' ? Date.parse(challenge.expiresAt) : NaN;
+  const pollIntervalMs = normalizeCliAuthPollIntervalMs(challenge.suggestedPollIntervalMs);
+
+  while (true) {
+    const pollUrlWithToken = new URL(pollUrl);
+    pollUrlWithToken.searchParams.set('token', challengeToken);
+    const pollResult = await fetchJson<CliAuthChallengePollResponse>(pollUrlWithToken.toString());
+    const status = typeof pollResult.status === 'string' ? pollResult.status.trim().toLowerCase() : 'pending';
+
+    if (status === 'approved') {
+      const boardApiToken = typeof pollResult.boardApiToken === 'string' && pollResult.boardApiToken.trim()
+        ? pollResult.boardApiToken.trim()
+        : typeof challenge.boardApiToken === 'string' && challenge.boardApiToken.trim()
+          ? challenge.boardApiToken.trim()
+          : '';
+      if (!boardApiToken) {
+        throw new Error('Paperclip approved board access but did not return a usable API token.');
+      }
+
+      return boardApiToken;
+    }
+
+    if (status === 'cancelled') {
+      throw new Error('Board access approval was cancelled.');
+    }
+
+    if (status === 'expired') {
+      throw new Error('Board access approval expired. Start the connection flow again.');
+    }
+
+    if (Number.isFinite(expiresAtTimeMs) && Date.now() >= expiresAtTimeMs) {
+      throw new Error('Board access approval expired. Start the connection flow again.');
+    }
+
+    await waitForDuration(pollIntervalMs);
+  }
+}
+
+async function fetchBoardAccessIdentity(boardApiToken: string): Promise<string | null> {
+  const identity = await fetchJson<CliAuthIdentityResponse>('/api/cli-auth/me', {
+    headers: {
+      authorization: `Bearer ${boardApiToken.trim()}`
+    }
+  });
+
+  return getCliAuthIdentityLabel(identity);
 }
 
 function getSyncStatus(syncState: SyncRunState, runningSync: boolean, syncUnlocked: boolean): { label: string; tone: Tone } {
@@ -2319,37 +2557,45 @@ function getSyncMetricCards(params: {
   ];
 }
 
-function getDashboardSummary(
-  tokenValid: boolean,
-  savedMappingCount: number,
-  syncState: SyncRunState,
-  runningSync: boolean,
-  scheduleFrequencyMinutes: number
-): { label: string; tone: Tone; title: string; body: string } {
-  const cadence = formatScheduleFrequency(scheduleFrequencyMinutes);
-  const activeRateLimitPause = getActiveRateLimitPause(syncState);
+function getDashboardSummary(params: {
+  syncIssue: SyncConfigurationIssue | null;
+  hasCompanyContext: boolean;
+  syncState: SyncRunState;
+  runningSync: boolean;
+  scheduleFrequencyMinutes: number;
+}): { label: string; tone: Tone; title: string; body: string } {
+  const cadence = formatScheduleFrequency(params.scheduleFrequencyMinutes);
+  const activeRateLimitPause = getActiveRateLimitPause(params.syncState);
   const rateLimitResourceLabel = getGitHubRateLimitResourceLabel(activeRateLimitPause?.resource);
 
-  if (!tokenValid) {
-    return {
-      label: 'Setup required',
-      tone: 'warning',
-      title: 'Finish setup to start syncing',
-      body: 'Open settings to validate GitHub access and configure your first repository.'
-    };
+  switch (params.syncIssue) {
+    case 'missing_token':
+      return {
+        label: 'Setup required',
+        tone: 'warning',
+        title: 'Finish setup to start syncing',
+        body: 'Open settings to validate GitHub access and configure your first repository.'
+      };
+    case 'missing_mapping':
+      return {
+        label: 'Setup required',
+        tone: 'warning',
+        title: 'Add your first repository',
+        body: 'Open settings to connect one repository to a Paperclip project.'
+      };
+    case 'missing_board_access':
+      return {
+        label: 'Board access required',
+        tone: 'warning',
+        title: 'Connect Paperclip board access',
+        body: params.hasCompanyContext
+          ? 'This Paperclip deployment requires board access before worker-side sync can use local REST endpoints.'
+          : 'Open plugin settings inside a company to connect required Paperclip board access for this deployment.'
+      };
   }
 
-  if (savedMappingCount === 0) {
-    return {
-      label: 'Setup required',
-      tone: 'warning',
-      title: 'Add your first repository',
-      body: 'Open settings to connect one repository to a Paperclip project.'
-    };
-  }
-
-  if (runningSync || syncState.status === 'running') {
-    const progress = getRunningSyncProgressModel(syncState);
+  if (params.runningSync || params.syncState.status === 'running') {
+    const progress = getRunningSyncProgressModel(params.syncState);
     return {
       label: 'Syncing',
       tone: 'info',
@@ -2367,21 +2613,21 @@ function getDashboardSummary(
     };
   }
 
-  if (syncState.status === 'error') {
+  if (params.syncState.status === 'error') {
     return {
       label: 'Needs attention',
       tone: 'danger',
       title: 'Last sync needs attention',
-      body: syncState.message ?? 'Open settings to review the latest GitHub sync issue.'
+      body: params.syncState.message ?? 'Open settings to review the latest GitHub sync issue.'
     };
   }
 
-  if (syncState.checkedAt) {
+  if (params.syncState.checkedAt) {
     return {
       label: 'Ready',
-      tone: syncState.status === 'success' ? 'success' : 'info',
+      tone: params.syncState.status === 'success' ? 'success' : 'info',
       title: 'GitHub sync activity',
-      body: syncState.message ?? `Automatic sync runs ${cadence}.`
+      body: params.syncState.message ?? `Automatic sync runs ${cadence}.`
     };
   }
 
@@ -2678,24 +2924,32 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
   const hostContext = useHostContext();
   const toast = usePluginToast();
   const pluginIdFromLocation = getPluginIdFromLocation();
-  const settings = usePluginData<GitHubSyncSettings>('settings.registration', {});
+  const settings = usePluginData<GitHubSyncSettings>(
+    'settings.registration',
+    hostContext.companyId ? { companyId: hostContext.companyId } : {}
+  );
   const saveRegistration = usePluginAction('settings.saveRegistration');
+  const updateBoardAccess = usePluginAction('settings.updateBoardAccess');
   const validateToken = usePluginAction('settings.validateToken');
   const runSyncNow = usePluginAction('sync.runNow');
   const [form, setForm] = useState<GitHubSyncSettings>(EMPTY_SETTINGS);
   const [submittingToken, setSubmittingToken] = useState(false);
+  const [connectingBoardAccess, setConnectingBoardAccess] = useState(false);
   const [submittingSetup, setSubmittingSetup] = useState(false);
   const [runningSync, setRunningSync] = useState(false);
   const [manualSyncRequestError, setManualSyncRequestError] = useState<string | null>(null);
   const [scheduleFrequencyDraft, setScheduleFrequencyDraft] = useState(String(DEFAULT_SCHEDULE_FREQUENCY_MINUTES));
   const [tokenStatusOverride, setTokenStatusOverride] = useState<TokenStatus | null>(null);
   const [validatedLogin, setValidatedLogin] = useState<string | null>(null);
+  const [boardAccessIdentity, setBoardAccessIdentity] = useState<string | null>(null);
   const [tokenDraft, setTokenDraft] = useState('');
   const [showSavedTokenHint, setShowSavedTokenHint] = useState(false);
   const [showTokenEditor, setShowTokenEditor] = useState(false);
   const [cachedSettings, setCachedSettings] = useState<GitHubSyncSettings | null>(null);
   const themeMode = useResolvedThemeMode();
+  const boardAccessRequirement = usePaperclipBoardAccessRequirement();
   const armSyncCompletionToast = useSyncCompletionToast(form.syncState, toast);
+  const boardAccessConfigSyncAttemptRef = useRef<string | null>(null);
 
   const currentSettings = settings.data ?? cachedSettings;
   const showInitialLoadingState = settings.loading && !settings.data && !cachedSettings;
@@ -2718,11 +2972,15 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
       scheduleFrequencyMinutes: nextScheduleFrequencyMinutes,
       paperclipApiBaseUrl: settings.data.paperclipApiBaseUrl,
       githubTokenConfigured: settings.data.githubTokenConfigured,
+      paperclipBoardAccessConfigured: settings.data.paperclipBoardAccessConfigured,
       totalSyncedIssuesCount: settings.data.totalSyncedIssuesCount,
       updatedAt: settings.data.updatedAt
     });
     setScheduleFrequencyDraft(String(nextScheduleFrequencyMinutes));
     setTokenDraft('');
+    if (!settings.data.paperclipBoardAccessConfigured) {
+      setBoardAccessIdentity(null);
+    }
 
     if (settings.data.githubTokenConfigured) {
       setShowSavedTokenHint(true);
@@ -2733,6 +2991,72 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
       setValidatedLogin(null);
     }
   }, [settings.data, showSavedTokenHint]);
+
+  useEffect(() => {
+    const companyId = hostContext.companyId;
+    const secretRef =
+      settings.data?.paperclipBoardAccessNeedsConfigSync
+        ? settings.data.paperclipBoardAccessConfigSyncRef
+        : undefined;
+
+    if (!companyId || !pluginIdFromLocation || !secretRef) {
+      return;
+    }
+
+    const attemptKey = `${companyId}:${secretRef}`;
+    if (boardAccessConfigSyncAttemptRef.current === attemptKey) {
+      return;
+    }
+    boardAccessConfigSyncAttemptRef.current = attemptKey;
+
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        await patchPluginConfig(pluginIdFromLocation, {
+          paperclipBoardApiTokenRefs: {
+            [companyId]: secretRef
+          }
+        });
+
+        if (cancelled) {
+          return;
+        }
+
+        notifyGitHubSyncSettingsChanged();
+
+        try {
+          await settings.refresh();
+        } catch {
+          return;
+        }
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+
+        toast({
+          title: 'Paperclip board access needs reconnection',
+          body:
+            error instanceof Error
+              ? error.message
+              : 'GitHub Sync could not finish migrating the saved Paperclip board access secret into plugin config.',
+          tone: 'error'
+        });
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    hostContext.companyId,
+    pluginIdFromLocation,
+    settings.data?.paperclipBoardAccessNeedsConfigSync,
+    settings.data?.paperclipBoardAccessConfigSyncRef,
+    settings.refresh,
+    toast
+  ]);
 
   useEffect(() => {
     const hasSavedToken = Boolean(form.githubTokenConfigured || showSavedTokenHint);
@@ -2773,7 +3097,11 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
 
   const theme = themeMode === 'light' ? LIGHT_PALETTE : DARK_PALETTE;
   const themeVars = buildThemeVars(theme, themeMode);
+  const hasCompanyContext = Boolean(hostContext.companyId);
   const hasSavedToken = Boolean(form.githubTokenConfigured || showSavedTokenHint);
+  const boardAccessConfigured = Boolean(form.paperclipBoardAccessConfigured);
+  const boardAccessRequired = boardAccessRequirement.required;
+  const boardAccessReady = !boardAccessRequired || (hasCompanyContext && boardAccessConfigured);
   const tokenStatus = tokenStatusOverride ?? (hasSavedToken ? 'valid' : 'required');
   const tokenTone: Tone = tokenStatus === 'valid' ? 'success' : tokenStatus === 'invalid' ? 'danger' : 'warning';
   const tokenBannerLabel = tokenStatus === 'valid' ? 'Token valid' : tokenStatus === 'invalid' ? 'Token invalid' : 'Token required';
@@ -2784,15 +3112,51 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
         : tokenStatus === 'required'
           ? 'Add a token to continue.'
           : null;
+  const boardAccessTone: Tone =
+    connectingBoardAccess
+      ? 'info'
+      : boardAccessConfigured
+        ? 'success'
+        : boardAccessRequired
+          ? 'warning'
+          : 'info';
+  const boardAccessBannerLabel =
+    connectingBoardAccess
+      ? 'Connecting'
+      : boardAccessConfigured
+        ? 'Connected'
+        : boardAccessRequired
+          ? 'Required'
+          : boardAccessRequirement.status === 'loading'
+            ? 'Checking'
+            : 'Optional';
+  const boardAccessDescription = boardAccessConfigured
+    ? 'Direct Paperclip REST calls will send a board bearer token for this company.'
+    : boardAccessRequired
+      ? hasCompanyContext
+        ? 'This Paperclip deployment requires board access before worker-side label and issue REST calls can run.'
+        : 'This Paperclip deployment requires board access, but you need to open plugin settings inside a company to connect it.'
+      : boardAccessRequirement.status === 'loading'
+        ? 'Checking whether this Paperclip deployment requires board-user authentication for direct REST calls.'
+        : 'Connect board access if this Paperclip deployment requires a board-user sign-in for local REST labels or issues.';
   const repositoriesUnlocked = tokenStatus === 'valid';
   const savedMappingsSource = currentSettings ? currentSettings.mappings ?? [] : form.mappings;
   const savedMappings = getComparableMappings(savedMappingsSource);
   const draftMappings = getComparableMappings(form.mappings);
   const savedMappingCount = savedMappings.length;
-  const syncUnlocked = tokenStatus === 'valid' && savedMappingCount > 0;
+  const syncSetupIssue = getSyncSetupIssue({
+    tokenStatus,
+    savedMappingCount,
+    boardAccessRequired,
+    boardAccessConfigured,
+    hasCompanyContext
+  });
+  const syncUnlocked = syncSetupIssue === null;
+  const syncSetupMessage = getSyncSetupMessage(syncSetupIssue, hasCompanyContext);
   const displaySyncState = getDisplaySyncState(form.syncState, {
     hasToken: tokenStatus === 'valid',
-    hasMappings: savedMappingCount > 0
+    hasMappings: savedMappingCount > 0,
+    hasBoardAccess: boardAccessReady
   });
   const mappingsDirty = JSON.stringify(draftMappings) !== JSON.stringify(savedMappings);
   const scheduleFrequencyError = getScheduleFrequencyError(scheduleFrequencyDraft);
@@ -2818,6 +3182,35 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
     !showInitialLoadingState &&
     scheduleFrequencyError === null &&
     (mappingsDirty || scheduleDirty);
+  const canConnectBoardAccess =
+    hasCompanyContext &&
+    !settingsMutationsLocked &&
+    !connectingBoardAccess &&
+    !showInitialLoadingState;
+  const boardAccessStatusLabel =
+    !hasCompanyContext
+      ? 'Unavailable'
+      : boardAccessBannerLabel;
+  const boardAccessStatusTone: Tone =
+    !hasCompanyContext
+      ? boardAccessRequired
+        ? 'warning'
+        : 'neutral'
+      : boardAccessTone;
+  const boardAccessSummaryText =
+    !hasCompanyContext
+      ? boardAccessRequired
+        ? 'This deployment requires board access. Open settings inside a company to connect it.'
+        : 'Open settings inside a company.'
+      : connectingBoardAccess
+        ? 'Approval in progress.'
+        : boardAccessConfigured
+          ? 'Connected for this company.'
+          : boardAccessRequired
+            ? 'Required before sync can run on this deployment.'
+            : boardAccessRequirement.status === 'loading'
+              ? 'Checking whether this deployment needs board access.'
+              : 'Connect if Paperclip REST requires sign-in.';
   const showTokenForm = tokenStatus !== 'valid' || showTokenEditor;
   const lastUpdated = formatDate(form.updatedAt ?? currentSettings?.updatedAt, 'Not saved yet');
   const lastSync = formatDate(displaySyncState.checkedAt, 'Never');
@@ -2832,7 +3225,7 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
   const syncSummaryPrimaryText =
     syncProgress?.title ??
     displaySyncState.message ??
-    (syncUnlocked ? 'Ready to sync.' : tokenStatus === 'valid' ? 'Save a repository to enable sync.' : 'Add a valid token to enable sync.');
+    (syncUnlocked ? 'Ready to sync.' : syncSetupMessage);
   const syncSummarySecondaryText = syncProgress
     ? [
         syncProgress.issueProgressLabel,
@@ -2950,13 +3343,8 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
       const secretName = `github_sync_${companyId.replace(/[^a-z0-9]+/gi, '_').toLowerCase()}`;
       const secret = await resolveOrCreateCompanySecret(companyId, secretName, trimmedToken);
 
-      await fetchJson(`/api/plugins/${pluginIdFromLocation}/config`, {
-        method: 'POST',
-        body: JSON.stringify({
-          configJson: {
-            githubTokenRef: secret.id
-          }
-        })
+      await patchPluginConfig(pluginIdFromLocation, {
+        githubTokenRef: secret.id
       });
       await saveRegistration({
         githubTokenRef: secret.id
@@ -2991,6 +3379,88 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
       });
     } finally {
       setSubmittingToken(false);
+    }
+  }
+
+  async function handleConnectBoardAccess() {
+    setConnectingBoardAccess(true);
+    let approvalWindow: Window | null = null;
+
+    try {
+      const companyId = hostContext.companyId;
+      if (!companyId) {
+        throw new Error('Company context is required to connect Paperclip board access.');
+      }
+
+      if (!pluginIdFromLocation) {
+        throw new Error('Plugin id is required to connect Paperclip board access.');
+      }
+
+      if (typeof window !== 'undefined') {
+        approvalWindow = window.open('about:blank', '_blank');
+      }
+
+      const challenge = await requestBoardAccessChallenge(companyId);
+      const approvalUrl = resolveCliAuthUrl(challenge.approvalUrl, challenge.approvalPath);
+      if (!approvalUrl) {
+        throw new Error('Paperclip did not return a board approval URL.');
+      }
+
+      if (!approvalWindow && typeof window !== 'undefined') {
+        approvalWindow = window.open(approvalUrl, '_blank');
+      } else {
+        approvalWindow?.location.replace(approvalUrl);
+      }
+
+      if (!approvalWindow) {
+        throw new Error('Allow pop-ups for Paperclip, then try connecting board access again.');
+      }
+
+      const boardApiToken = await waitForBoardAccessApproval(challenge);
+      const identity = await fetchBoardAccessIdentity(boardApiToken);
+      const secretName = `paperclip_board_api_${companyId.replace(/[^a-z0-9]+/gi, '_').toLowerCase()}`;
+      const secret = await resolveOrCreateCompanySecret(companyId, secretName, boardApiToken);
+
+      await patchPluginConfig(pluginIdFromLocation, {
+        paperclipBoardApiTokenRefs: {
+          [companyId]: secret.id
+        }
+      });
+      await updateBoardAccess({
+        companyId,
+        paperclipBoardApiTokenRef: secret.id
+      });
+
+      setBoardAccessIdentity(identity);
+      setForm((current) => ({
+        ...current,
+        paperclipBoardAccessConfigured: true
+      }));
+      toast({
+        title: identity ? `Paperclip board access connected as ${identity}` : 'Paperclip board access connected',
+        body: 'Direct Paperclip REST calls can now authenticate in authenticated deployments.',
+        tone: 'success'
+      });
+      notifyGitHubSyncSettingsChanged();
+
+      try {
+        await settings.refresh();
+      } catch {
+        return;
+      }
+    } catch (error) {
+      toast({
+        title: 'Paperclip board access could not be connected',
+        body: error instanceof Error ? error.message : 'Unable to finish the Paperclip board access approval flow.',
+        tone: 'error'
+      });
+    } finally {
+      setConnectingBoardAccess(false);
+      try {
+        approvalWindow?.close();
+      } catch {
+        return;
+      }
     }
   }
 
@@ -3091,7 +3561,7 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
 
     try {
       if (!syncUnlocked) {
-        throw new Error('Save at least one repository before running sync.');
+        throw new Error(syncSetupMessage);
       }
 
       const result = await runSyncNow({
@@ -3142,7 +3612,7 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
       <section className="ghsync__header">
         <div className="ghsync__header-copy">
           <h2>GitHub Sync settings</h2>
-          <p>Add a token to get started.</p>
+          <p>Add a GitHub token to get started, then connect board access if this deployment requires authenticated board users.</p>
           {settingsMutationsLockReason ? <p className="ghsync__hint">{settingsMutationsLockReason}</p> : null}
         </div>
         <span className={`ghsync__badge ${getToneClass(tokenTone)}`}>
@@ -3233,6 +3703,67 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
                 >
                   Replace token
                 </button>
+              </div>
+            )}
+          </section>
+
+          <section className="ghsync__section">
+            <div className="ghsync__section-head">
+              <div className="ghsync__section-copy">
+                <h4>Paperclip board access</h4>
+                <p>{boardAccessDescription}</p>
+              </div>
+              <span className={`ghsync__badge ${getToneClass(boardAccessTone)}`}>
+                {boardAccessBannerLabel}
+              </span>
+            </div>
+
+            {hostContext.companyId ? (
+              <div className="ghsync__connected">
+                <div>
+                  <strong>
+                    {boardAccessConfigured
+                      ? boardAccessIdentity
+                        ? `Connected as ${boardAccessIdentity}`
+                        : 'Connected for this company'
+                      : boardAccessRequired
+                        ? 'Required for this deployment'
+                        : boardAccessRequirement.status === 'loading'
+                          ? 'Checking whether board access is required'
+                          : 'Optional for this deployment'}
+                  </strong>
+                  <span>
+                    {boardAccessConfigured
+                      ? 'The worker will attach a board bearer token to local Paperclip label and issue REST calls.'
+                      : boardAccessRequired
+                        ? 'This deployment is authenticated, so the worker needs a board bearer token before it can use local Paperclip label and issue REST calls.'
+                        : boardAccessRequirement.status === 'loading'
+                          ? 'GitHub Sync is checking whether local Paperclip REST endpoints require board-user sign-in.'
+                          : 'Use this when Paperclip boards are public-facing but still require a board-user sign-in before labels or issues can be changed.'}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className={getPluginActionClassName({ variant: boardAccessConfigured ? 'secondary' : 'primary' })}
+                  disabled={!canConnectBoardAccess}
+                  onClick={() => {
+                    void handleConnectBoardAccess();
+                  }}
+                >
+                  {connectingBoardAccess
+                    ? 'Waiting for approval…'
+                    : boardAccessConfigured
+                      ? 'Reconnect'
+                      : 'Connect board access'}
+                </button>
+              </div>
+            ) : (
+              <div className="ghsync__locked">
+                <div>
+                  <strong>Board access needs a company context</strong>
+                  <span>Open plugin settings from inside a Paperclip company to connect board access.</span>
+                </div>
+                <span className="ghsync__badge ghsync__badge--neutral">Unavailable</span>
               </div>
             )}
           </section>
@@ -3378,8 +3909,8 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
                 {!syncUnlocked ? (
                   <div className="ghsync__locked">
                     <div>
-                      <strong>Manual sync is locked</strong>
-                      <span>Save a repository first.</span>
+                      <strong>{syncSetupIssue === 'missing_board_access' ? 'Paperclip board access is required' : 'Manual sync is locked'}</strong>
+                      <span>{syncSetupMessage}</span>
                     </div>
                     <span className="ghsync__badge ghsync__badge--neutral">Locked</span>
                   </div>
@@ -3466,10 +3997,20 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
 
             <div className="ghsync__check">
               <div className="ghsync__check-top">
+                <strong>Paperclip board access</strong>
+                <span className={`ghsync__badge ${getToneClass(boardAccessStatusTone)}`}>
+                  {boardAccessStatusLabel}
+                </span>
+              </div>
+              <span>{boardAccessSummaryText}</span>
+            </div>
+
+            <div className="ghsync__check">
+              <div className="ghsync__check-top">
                 <strong>Sync</strong>
                 <span className={`ghsync__badge ${getToneClass(syncStatus.tone)}`}>{syncStatus.label}</span>
               </div>
-              <span>{!syncUnlocked ? (tokenStatus === 'valid' ? 'Save a repository to enable sync.' : 'Requires a token.') : `Auto-sync ${scheduleDescription}.`}</span>
+              <span>{syncUnlocked ? `Auto-sync ${scheduleDescription}.` : syncSetupMessage}</span>
             </div>
 
             <div className="ghsync__detail-list">
@@ -3494,15 +4035,19 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
 }
 
 export function GitHubSyncDashboardWidget(): React.JSX.Element {
-  useHostContext();
+  const hostContext = useHostContext();
   const toast = usePluginToast();
-  const settings = usePluginData<GitHubSyncSettings>('settings.registration', {});
+  const settings = usePluginData<GitHubSyncSettings>(
+    'settings.registration',
+    hostContext.companyId ? { companyId: hostContext.companyId } : {}
+  );
   const runSyncNow = usePluginAction('sync.runNow');
   const [runningSync, setRunningSync] = useState(false);
   const [manualSyncRequestError, setManualSyncRequestError] = useState<string | null>(null);
   const [settingsHref, setSettingsHref] = useState(SETTINGS_INDEX_HREF);
   const [cachedSettings, setCachedSettings] = useState<GitHubSyncSettings | null>(null);
   const themeMode = useResolvedThemeMode();
+  const boardAccessRequirement = usePaperclipBoardAccessRequirement();
 
   const theme = themeMode === 'light' ? LIGHT_PALETTE : DARK_PALETTE;
   const themeVars = buildThemeVars(theme, themeMode);
@@ -3510,16 +4055,35 @@ export function GitHubSyncDashboardWidget(): React.JSX.Element {
   const showInitialLoadingState = settings.loading && !settings.data && !cachedSettings;
   const syncState = current.syncState ?? EMPTY_SETTINGS.syncState;
   const tokenValid = Boolean(current.githubTokenConfigured);
+  const hasCompanyContext = Boolean(hostContext.companyId);
+  const boardAccessConfigured = Boolean(current.paperclipBoardAccessConfigured);
+  const boardAccessRequired = boardAccessRequirement.required;
+  const boardAccessReady = !boardAccessRequired || (hasCompanyContext && boardAccessConfigured);
   const savedMappingCount = getComparableMappings(current.mappings ?? []).length;
+  const syncSetupIssue = getSyncSetupIssue({
+    tokenStatus: tokenValid ? 'valid' : 'required',
+    savedMappingCount,
+    boardAccessRequired,
+    boardAccessConfigured,
+    hasCompanyContext
+  });
+  const syncSetupMessage = getSyncSetupMessage(syncSetupIssue, hasCompanyContext);
   const displaySyncState = getDisplaySyncState(syncState, {
     hasToken: tokenValid,
-    hasMappings: savedMappingCount > 0
+    hasMappings: savedMappingCount > 0,
+    hasBoardAccess: boardAccessReady
   });
-  const syncUnlocked = tokenValid && savedMappingCount > 0;
+  const syncUnlocked = syncSetupIssue === null;
   const syncInFlight = runningSync || displaySyncState.status === 'running';
   const scheduleFrequencyMinutes = normalizeScheduleFrequencyMinutes(current.scheduleFrequencyMinutes);
   const scheduleDescription = formatScheduleFrequency(scheduleFrequencyMinutes);
-  const summary = getDashboardSummary(tokenValid, savedMappingCount, displaySyncState, runningSync, scheduleFrequencyMinutes);
+  const summary = getDashboardSummary({
+    syncIssue: syncSetupIssue,
+    hasCompanyContext,
+    syncState: displaySyncState,
+    runningSync,
+    scheduleFrequencyMinutes
+  });
   const syncProgress = getRunningSyncProgressModel(displaySyncState);
   const syncMetricCards = getSyncMetricCards({
     totalSyncedIssuesCount: current.totalSyncedIssuesCount,
@@ -3588,6 +4152,10 @@ export function GitHubSyncDashboardWidget(): React.JSX.Element {
     setManualSyncRequestError(null);
 
     try {
+      if (!syncUnlocked) {
+        throw new Error(syncSetupMessage);
+      }
+
       const result = await runSyncNow({
         paperclipApiBaseUrl: getPaperclipApiBaseUrl()
       }) as GitHubSyncSettings;
@@ -3684,13 +4252,17 @@ export function GitHubSyncDashboardWidget(): React.JSX.Element {
                     syncProgress.currentIssueLabel ?? syncProgress.repositoryPosition
                   ].filter((value): value is string => Boolean(value))
                     .join(' · ')
-              : !tokenValid
+              : syncSetupIssue === 'missing_token'
                 ? 'Open settings to validate GitHub access.'
-                : savedMappingCount === 0
+                : syncSetupIssue === 'missing_mapping'
                   ? 'Open settings and add a repository. The Paperclip project will be created if it does not exist.'
-                  : displaySyncState.checkedAt
-                    ? `Last checked ${lastSync}.`
-                    : 'Everything is configured. Run the first sync when you are ready.'}
+                  : syncSetupIssue === 'missing_board_access'
+                    ? hasCompanyContext
+                      ? 'Open settings and connect Paperclip board access before running sync.'
+                      : 'Open plugin settings inside a company to connect required Paperclip board access.'
+                    : displaySyncState.checkedAt
+                      ? `Last checked ${lastSync}.`
+                      : 'Everything is configured. Run the first sync when you are ready.'}
           </span>
         </div>
 
@@ -3770,8 +4342,13 @@ function GitHubSyncToolbarButtonSurface(props: {
     ...(effectiveEntityId ? { entityId: effectiveEntityId } : {}),
     ...(props.entityType ? { entityType: props.entityType } : {})
   });
+  const settingsRegistration = usePluginData<GitHubSyncSettings>(
+    'settings.registration',
+    props.companyId ? { companyId: props.companyId } : {}
+  );
   const [runningSync, setRunningSync] = useState(false);
   const themeMode = useResolvedThemeMode();
+  const boardAccessRequirement = usePaperclipBoardAccessRequirement();
   const theme = themeMode === 'light' ? LIGHT_PALETTE : DARK_PALETTE;
   const themeVars = buildThemeVars(theme, themeMode);
   const state = toolbarState.data ?? {
@@ -3783,6 +4360,18 @@ function GitHubSyncToolbarButtonSurface(props: {
     githubTokenConfigured: false,
     savedMappingCount: 0
   };
+  const hasCompanyContext = Boolean(props.companyId);
+  const boardAccessConfigured = Boolean(settingsRegistration.data?.paperclipBoardAccessConfigured);
+  const boardAccessSetupIssue: SyncConfigurationIssue | null =
+    state.canRun && boardAccessRequirement.required && (!hasCompanyContext || !boardAccessConfigured)
+      ? 'missing_board_access'
+      : null;
+  const effectiveCanRun = state.canRun && !boardAccessSetupIssue;
+  const effectiveMessage =
+    boardAccessSetupIssue
+      ? getSyncSetupMessage(boardAccessSetupIssue, hasCompanyContext)
+      : state.message;
+  const effectiveLabel = boardAccessSetupIssue ? 'Board access required' : state.label;
   const syncInFlight = runningSync || state.syncState.status === 'running';
   const armSyncCompletionToast = useSyncCompletionToast(state.syncState, toast);
 
@@ -3808,6 +4397,12 @@ function GitHubSyncToolbarButtonSurface(props: {
     const refreshToolbarState = () => {
       try {
         toolbarState.refresh();
+      } catch {
+        // Keep going so the settings registration still gets a refresh attempt.
+      }
+
+      try {
+        settingsRegistration.refresh();
       } catch {
         return;
       }
@@ -3840,7 +4435,7 @@ function GitHubSyncToolbarButtonSurface(props: {
       window.removeEventListener('focus', handleWindowFocus);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [toolbarState.refresh, props.companyId, effectiveEntityId, props.entityType]);
+  }, [toolbarState.refresh, settingsRegistration.refresh, props.companyId, effectiveEntityId, props.entityType]);
 
   useEffect(() => {
     if (!props.entityType) {
@@ -3869,6 +4464,10 @@ function GitHubSyncToolbarButtonSurface(props: {
 
   async function handleRunSync(): Promise<void> {
     try {
+      if (!effectiveCanRun) {
+        throw new Error(effectiveMessage ?? 'Unable to run GitHub sync.');
+      }
+
       setRunningSync(true);
       const result = await runSyncNow({
         waitForCompletion: false,
@@ -3903,7 +4502,7 @@ function GitHubSyncToolbarButtonSurface(props: {
       ref={surfaceRef}
       className={`ghsync-toolbar-button${props.entityType ? ' ghsync-toolbar-button--entity' : ''}`}
       style={themeVars}
-      title={toolbarState.error?.message ?? state.message}
+      title={toolbarState.error?.message ?? effectiveMessage}
     >
       <style>{EXTENSION_SURFACE_STYLES}</style>
       <button
@@ -3912,11 +4511,11 @@ function GitHubSyncToolbarButtonSurface(props: {
         data-variant="outline"
         data-size="sm"
         className={props.entityType ? HOST_ENTITY_BUTTON_CLASSNAME : HOST_GLOBAL_BUTTON_CLASSNAME}
-        disabled={!state.canRun || syncInFlight || toolbarState.loading}
+        disabled={!effectiveCanRun || syncInFlight || toolbarState.loading}
         onClick={handleRunSync}
       >
         <GitHubMarkIcon className="mr-1.5 h-3.5 w-3.5" />
-        <span>{syncInFlight ? 'Syncing…' : state.label}</span>
+        <span>{syncInFlight ? 'Syncing…' : effectiveLabel}</span>
       </button>
     </div>
   );

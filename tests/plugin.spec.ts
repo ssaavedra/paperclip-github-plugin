@@ -4,6 +4,9 @@ import test from 'node:test';
 import { createTestHarness } from '@paperclipai/plugin-sdk/testing';
 
 import manifest from '../src/manifest.ts';
+import { requiresPaperclipBoardAccess } from '../src/paperclip-health.ts';
+import { fetchJson, fetchPaperclipHealth, resolveCliAuthPollUrl } from '../src/ui/http.ts';
+import { mergePluginConfig } from '../src/ui/plugin-config.ts';
 import plugin from '../src/worker.ts';
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -11,6 +14,15 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: {
       'content-type': 'application/json'
+    }
+  });
+}
+
+function htmlResponse(body: string, status = 200): Response {
+  return new Response(body, {
+    status,
+    headers: {
+      'content-type': 'text/html; charset=utf-8'
     }
   });
 }
@@ -107,6 +119,18 @@ function getJsonRequestBody(init?: RequestInit): Record<string, unknown> | null 
   }
 
   return JSON.parse(init.body) as Record<string, unknown>;
+}
+
+function getRequestHeader(input: unknown, init: RequestInit | undefined, name: string): string | null {
+  const headers = new Headers(
+    typeof input === 'string' || input instanceof URL
+      ? init?.headers
+      : input && typeof input === 'object' && 'headers' in input
+        ? (input as { headers?: HeadersInit }).headers
+        : init?.headers
+  );
+
+  return headers.get(name);
 }
 
 function getGraphqlRequest(init?: RequestInit): { query: string; variables: Record<string, unknown> } {
@@ -239,6 +263,108 @@ function assertNormalizedPublicGitHubIssueDescription(description: string): void
   assert.doesNotMatch(description, /<img\b/i);
 }
 
+test('resolveCliAuthPollUrl prefixes the Paperclip API base path for challenge polling', () => {
+  assert.equal(
+    resolveCliAuthPollUrl('/cli-auth/challenges/ch_123', 'https://paperclip.example.test'),
+    'https://paperclip.example.test/api/cli-auth/challenges/ch_123'
+  );
+});
+
+test('fetchJson reports HTML API responses without throwing a raw JSON parse error', async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    assert.equal(getRequestHeader(input, init, 'accept'), 'application/json');
+    return htmlResponse('<!DOCTYPE html><html><body>Sign in</body></html>', 200);
+  };
+
+  try {
+    await assert.rejects(
+      fetchJson('/api/cli-auth/challenges', {
+        method: 'POST',
+        body: JSON.stringify({
+          requestedAccess: 'board'
+        })
+      }),
+      (error: unknown) => {
+        assert(error instanceof Error);
+        assert.match(error.message, /returned text\/html instead of JSON/i);
+        assert.match(error.message, /sign-in page or app shell/i);
+        assert.match(error.message, /\/api\/cli-auth\/challenges/i);
+        assert.doesNotMatch(error.message, /Unexpected token '</i);
+        return true;
+      }
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('fetchPaperclipHealth normalizes authenticated deployment metadata', async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    assert.equal(getRequestHeader(input, init, 'accept'), 'application/json');
+    assert.equal(getRequestUrl(input), 'https://paperclip.example.test/api/health');
+    return jsonResponse({
+      deploymentMode: 'authenticated',
+      deploymentExposure: 'public',
+      authReady: true
+    });
+  };
+
+  try {
+    const result = await fetchPaperclipHealth('https://paperclip.example.test');
+
+    assert.deepEqual(result, {
+      deploymentMode: 'authenticated',
+      deploymentExposure: 'public',
+      authReady: true
+    });
+    assert.equal(requiresPaperclipBoardAccess(result), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('fetchPaperclipHealth returns null when the Paperclip health endpoint is unavailable', async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (): Promise<Response> => htmlResponse('<!DOCTYPE html><html><body>Sign in</body></html>', 200);
+
+  try {
+    const result = await fetchPaperclipHealth('https://paperclip.example.test');
+    assert.equal(result, null);
+    assert.equal(requiresPaperclipBoardAccess(result), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('mergePluginConfig preserves existing config while merging board access refs by company', () => {
+  const result = mergePluginConfig(
+    {
+      githubTokenRef: 'github-secret-ref',
+      paperclipBoardApiTokenRefs: {
+        'company-1': 'board-secret-ref-1'
+      },
+      customFlag: true
+    },
+    {
+      paperclipBoardApiTokenRefs: {
+        'company-2': 'board-secret-ref-2'
+      }
+    }
+  );
+
+  assert.equal(result.githubTokenRef, 'github-secret-ref');
+  assert.deepEqual(result.paperclipBoardApiTokenRefs, {
+    'company-1': 'board-secret-ref-1',
+    'company-2': 'board-secret-ref-2'
+  });
+  assert.equal(result.customFlag, true);
+});
+
 test('manifest exposes GitHub Sync dashboard and settings UI metadata, config schema, and job', () => {
   assert.equal(manifest.id, 'paperclip-github-plugin');
   assert.equal(manifest.apiVersion, 1);
@@ -254,6 +380,7 @@ test('manifest exposes GitHub Sync dashboard and settings UI metadata, config sc
   assert.ok(manifest.capabilities.includes('issue.comments.read'));
   assert.ok(manifest.capabilities.includes('issue.comments.create'));
   assert.equal((manifest.instanceConfigSchema as { properties?: Record<string, unknown> }).properties?.githubTokenRef ? 'present' : 'missing', 'present');
+  assert.equal((manifest.instanceConfigSchema as { properties?: Record<string, unknown> }).properties?.paperclipBoardApiTokenRefs ? 'present' : 'missing', 'present');
   const settingsSlot = manifest.ui?.slots?.find((slot) => slot.type === 'settingsPage');
   const dashboardSlot = manifest.ui?.slots?.find((slot) => slot.type === 'dashboardWidget');
   const issueDetailSlot = manifest.ui?.slots?.find((slot) => slot.type === 'detailTab');
@@ -847,6 +974,80 @@ test('settings.registration reports a configured token without resolving the sav
 
   assert.equal(result.githubTokenConfigured, true);
   assert.equal(result.syncState?.status, 'idle');
+  assert.equal(resolveCount, 0);
+});
+
+test('settings.registration reports company-specific board access without resolving the saved secret', async () => {
+  const harness = createTestHarness({ manifest });
+  await plugin.definition.setup(harness.ctx);
+
+  let resolveCount = 0;
+  harness.ctx.secrets.resolve = async () => {
+    resolveCount += 1;
+    throw new Error('Board token resolution should not happen for settings data.');
+  };
+
+  await harness.performAction('settings.updateBoardAccess', {
+    companyId: 'company-1',
+    paperclipBoardApiTokenRef: 'board-secret-ref'
+  });
+
+  const companyOneResult = await harness.getData<{
+    paperclipBoardAccessConfigured?: boolean;
+    paperclipBoardAccessNeedsConfigSync?: boolean;
+    paperclipBoardAccessConfigSyncRef?: string;
+  }>('settings.registration', {
+    companyId: 'company-1'
+  });
+  const companyTwoResult = await harness.getData<{
+    paperclipBoardAccessConfigured?: boolean;
+    paperclipBoardAccessNeedsConfigSync?: boolean;
+  }>('settings.registration', {
+    companyId: 'company-2'
+  });
+
+  assert.equal(companyOneResult.paperclipBoardAccessConfigured, true);
+  assert.equal(companyOneResult.paperclipBoardAccessNeedsConfigSync, true);
+  assert.equal(companyOneResult.paperclipBoardAccessConfigSyncRef, 'board-secret-ref');
+  assert.equal(companyTwoResult.paperclipBoardAccessConfigured, false);
+  assert.equal(companyTwoResult.paperclipBoardAccessNeedsConfigSync, false);
+  assert.equal(resolveCount, 0);
+});
+
+test('settings.registration reports company-specific board access from plugin config without resolving the saved secret', async () => {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      paperclipBoardApiTokenRefs: {
+        'company-1': 'board-secret-ref'
+      }
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+
+  let resolveCount = 0;
+  harness.ctx.secrets.resolve = async () => {
+    resolveCount += 1;
+    throw new Error('Board token resolution should not happen for settings data.');
+  };
+
+  const companyOneResult = await harness.getData<{
+    paperclipBoardAccessConfigured?: boolean;
+    paperclipBoardAccessNeedsConfigSync?: boolean;
+  }>('settings.registration', {
+    companyId: 'company-1'
+  });
+  const companyTwoResult = await harness.getData<{
+    paperclipBoardAccessConfigured?: boolean;
+    paperclipBoardAccessNeedsConfigSync?: boolean;
+  }>('settings.registration', {
+    companyId: 'company-2'
+  });
+
+  assert.equal(companyOneResult.paperclipBoardAccessConfigured, true);
+  assert.equal(companyOneResult.paperclipBoardAccessNeedsConfigSync, false);
+  assert.equal(companyTwoResult.paperclipBoardAccessConfigured, false);
+  assert.equal(companyTwoResult.paperclipBoardAccessNeedsConfigSync, false);
   assert.equal(resolveCount, 0);
 });
 
@@ -1665,6 +1866,188 @@ test('worker maps GitHub labels onto existing Paperclip labels, creates missing 
   }
 });
 
+test('worker authenticates direct Paperclip REST label and issue sync calls with the configured board token', async () => {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRef: 'github-secret-ref',
+      paperclipBoardApiTokenRefs: {
+        'company-1': 'board-secret-ref'
+      }
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+  harness.ctx.http.fetch = async () => {
+    throw new Error('Local Paperclip REST calls should use direct worker fetch, not ctx.http.fetch.');
+  };
+  harness.ctx.secrets.resolve = async (secretRef) => {
+    if (secretRef === 'github-secret-ref') {
+      return 'github-token';
+    }
+
+    if (secretRef === 'board-secret-ref') {
+      return 'paperclip-board-token';
+    }
+
+    throw new Error(`Unexpected secret ref: ${secretRef}`);
+  };
+
+  const existingLabel = {
+    id: '00000000-0000-0000-0000-000000000031',
+    companyId: 'company-1',
+    name: 'bug',
+    color: '#d73a4a',
+    createdAt: '2026-04-09T10:00:00.000Z',
+    updatedAt: '2026-04-09T10:00:00.000Z'
+  };
+  const createdLabel = {
+    id: '00000000-0000-0000-0000-000000000032',
+    companyId: 'company-1',
+    name: 'needs board token',
+    color: '#0052cc',
+    createdAt: '2026-04-09T10:05:00.000Z',
+    updatedAt: '2026-04-09T10:05:00.000Z'
+  };
+
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      {
+        id: 'mapping-a',
+        repositoryUrl: 'paperclipai/example-repo',
+        paperclipProjectName: 'Engineering',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1'
+      }
+    ],
+    syncState: {
+      status: 'idle'
+    },
+    paperclipApiBaseUrl: 'http://127.0.0.1:63675'
+  });
+
+  const originalFetch = globalThis.fetch;
+  const originalCreate = harness.ctx.issues.create;
+  const originalUpdate = harness.ctx.issues.update;
+  const paperclipApiAuthHeaders: Array<{ path: string; authorization: string | null }> = [];
+
+  globalThis.fetch = async (input, init) => {
+    const rawUrl = getRequestUrl(input);
+    const url = new URL(rawUrl);
+
+    if (url.pathname.startsWith('/api/')) {
+      paperclipApiAuthHeaders.push({
+        path: url.pathname,
+        authorization: getRequestHeader(input, init, 'authorization')
+      });
+    }
+
+    if (url.pathname === '/api/companies/company-1/labels') {
+      const method = typeof input === 'string' || input instanceof URL ? init?.method : input.method;
+      if (method === 'POST') {
+        return jsonResponse(createdLabel);
+      }
+
+      return jsonResponse([existingLabel]);
+    }
+
+    if (url.pathname === '/api/companies/company-1/issues') {
+      const body = getJsonRequestBody(init);
+      const created = await originalCreate({
+        companyId: 'company-1',
+        projectId: 'project-1',
+        title: typeof body?.title === 'string' ? body.title : 'Board-authenticated import',
+        description: typeof body?.description === 'string' ? body.description : undefined
+      } as Parameters<typeof originalCreate>[0]);
+
+      return jsonResponse(created, 201);
+    }
+
+    if (url.pathname.startsWith('/api/issues/')) {
+      const issueId = url.pathname.split('/').at(-1) ?? '';
+      const body = getJsonRequestBody(init);
+      const status = typeof body?.status === 'string' ? body.status : undefined;
+      if (status === 'backlog' || status === 'todo' || status === 'in_progress' || status === 'in_review' || status === 'done' || status === 'blocked' || status === 'cancelled') {
+        await originalUpdate(issueId, { status }, 'company-1');
+      }
+
+      return jsonResponse({});
+    }
+
+    if (url.pathname === '/repos/paperclipai/example-repo/issues' && ['all', 'open'].includes(url.searchParams.get('state') ?? '')) {
+      return jsonResponse([
+        {
+          id: 2101,
+          number: 21,
+          title: 'Board-authenticated import',
+          body: 'Imported body',
+          html_url: 'https://github.com/paperclipai/example-repo/issues/21',
+          state: 'open',
+          labels: [
+            { name: 'bug', color: 'd73a4a' },
+            { name: 'needs board token', color: '0052cc' }
+          ]
+        }
+      ]);
+    }
+
+    if (url.pathname === '/graphql') {
+      const { query, variables } = getGraphqlRequest(init);
+      const issueNumber = typeof variables.issueNumber === 'number' ? variables.issueNumber : undefined;
+
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([
+          {
+            issueNumber: 21
+          }
+        ]);
+      }
+
+      if (query.includes('query GitHubIssueStatusSnapshot') && issueNumber === 21) {
+        return graphqlResponse({
+          repository: {
+            issue: {
+              number: 21,
+              state: 'OPEN',
+              stateReason: null,
+              comments: {
+                totalCount: 0
+              },
+              closedByPullRequestsReferences: {
+                pageInfo: {
+                  hasNextPage: false,
+                  endCursor: null
+                },
+                nodes: []
+              }
+            }
+          }
+        });
+      }
+    }
+
+    throw new Error(`Unexpected request: ${url.toString()}`);
+  };
+
+  try {
+    const sync = await harness.performAction('sync.runNow', {
+      waitForCompletion: true
+    }) as {
+      syncState: { status: string };
+    };
+
+    assert.equal(sync.syncState.status, 'success');
+    assert.ok(paperclipApiAuthHeaders.some((entry) => entry.path === '/api/companies/company-1/labels'));
+    assert.ok(paperclipApiAuthHeaders.some((entry) => entry.path === '/api/companies/company-1/issues'));
+    assert.ok(paperclipApiAuthHeaders.some((entry) => entry.path.startsWith('/api/issues/')));
+    assert.ok(
+      paperclipApiAuthHeaders.every((entry) => entry.authorization === 'Bearer paperclip-board-token'),
+      `Expected every Paperclip API request to include the board token, received ${JSON.stringify(paperclipApiAuthHeaders)}`
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('worker refreshes Paperclip labels before creating a missing label so newly-added labels are reused', async () => {
   const harness = createTestHarness({
     manifest,
@@ -2143,6 +2526,144 @@ test('worker resyncs labels for already-imported issues when GitHub labels chang
     assert.ok(importedIssueAfterSecondSync);
     assert.deepEqual(importedIssueAfterSecondSync?.labelIds, [docsLabel.id]);
     assert.equal(statusTransitionComments.length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('worker surfaces an actionable sync error when the Paperclip label API returns an authenticated HTML page', async () => {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRef: 'github-secret-ref'
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+  harness.ctx.http.fetch = async () => {
+    throw new Error('Local Paperclip label API calls should use direct worker fetch, not ctx.http.fetch.');
+  };
+
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      {
+        id: 'mapping-a',
+        repositoryUrl: 'paperclipai/example-repo',
+        paperclipProjectName: 'Engineering',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1'
+      }
+    ],
+    syncState: {
+      status: 'idle'
+    },
+    paperclipApiBaseUrl: 'https://board.example.com'
+  });
+
+  const originalFetch = globalThis.fetch;
+  const loginPage = '<!doctype html><html><body><h1>Sign in</h1></body></html>';
+
+  globalThis.fetch = async (input, init) => {
+    const rawUrl = getRequestUrl(input);
+    const url = new URL(rawUrl);
+
+    if (url.pathname === '/api/companies/company-1/issues') {
+      return htmlResponse(loginPage);
+    }
+
+    if (url.pathname === '/api/companies/company-1/labels') {
+      return htmlResponse(loginPage);
+    }
+
+    if (url.pathname === '/repos/paperclipai/example-repo/issues' && ['all', 'open'].includes(url.searchParams.get('state') ?? '')) {
+      return jsonResponse([
+        {
+          id: 2401,
+          number: 24,
+          title: 'Authenticated board label failure',
+          body: 'Body',
+          html_url: 'https://github.com/paperclipai/example-repo/issues/24',
+          state: 'open',
+          labels: [{ name: 'bug', color: 'd73a4a' }]
+        }
+      ]);
+    }
+
+    if (url.pathname === '/graphql') {
+      const { query, variables } = getGraphqlRequest(init);
+      const issueNumber = typeof variables.issueNumber === 'number' ? variables.issueNumber : undefined;
+
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([
+          {
+            issueNumber: 24
+          }
+        ]);
+      }
+
+      if (query.includes('query GitHubIssueStatusSnapshot') && issueNumber === 24) {
+        return graphqlResponse({
+          repository: {
+            issue: {
+              number: 24,
+              state: 'OPEN',
+              stateReason: null,
+              comments: {
+                totalCount: 0
+              },
+              closedByPullRequestsReferences: {
+                pageInfo: {
+                  hasNextPage: false,
+                  endCursor: null
+                },
+                nodes: []
+              }
+            }
+          }
+        });
+      }
+    }
+
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  try {
+    const sync = await harness.performAction('sync.runNow', {
+      waitForCompletion: true
+    }) as {
+      syncState: {
+        status: string;
+        createdIssuesCount?: number;
+        erroredIssuesCount?: number;
+        errorDetails?: {
+          phase?: string;
+          rawMessage?: string;
+          suggestedAction?: string;
+        };
+      };
+    };
+
+    assert.equal(sync.syncState.status, 'error');
+    assert.equal(sync.syncState.createdIssuesCount, 1);
+    assert.equal(sync.syncState.errorDetails?.phase, 'syncing_labels');
+    assert.match(sync.syncState.errorDetails?.rawMessage ?? '', /authenticated Paperclip API response/);
+    assert.match(sync.syncState.errorDetails?.rawMessage ?? '', /PAPERCLIP_API_URL/);
+    assert.match(sync.syncState.errorDetails?.suggestedAction ?? '', /PAPERCLIP_API_URL/);
+    assert.ok((sync.syncState.erroredIssuesCount ?? 0) >= 1);
+    assert.ok(
+      harness.logs.find((entry) =>
+        entry.level === 'warn'
+        && entry.message === 'Unable to create a Paperclip label through the local API.'
+        && entry.meta?.requiresAuthentication === true
+        && entry.meta?.error === 'Expected JSON from the Paperclip label create API but received an HTML sign-in page.'
+      )
+    );
+
+    const importedIssue = (await harness.ctx.issues.list({
+      companyId: 'company-1'
+    })).find((issue) => issue.title === 'Authenticated board label failure');
+
+    assert.ok(importedIssue);
+    assert.deepEqual(importedIssue?.labelIds ?? [], []);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -3335,6 +3856,170 @@ test('worker falls back to the SDK bridge when the local Paperclip description P
     assert.ok(importedIssue);
     assert.doesNotMatch(importedIssue?.description ?? '', /^\*\s+GitHub issue:/m);
     assert.match(importedIssue?.description ?? '', /Description survives even if the local PATCH response is stale\./);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('worker falls back to the SDK bridge when the local Paperclip description PATCH returns an HTML sign-in page', async () => {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRef: 'github-secret-ref'
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+  harness.ctx.http.fetch = async () => {
+    throw new Error('Local Paperclip issue API calls should use direct worker fetch, not ctx.http.fetch.');
+  };
+
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      {
+        id: 'mapping-a',
+        repositoryUrl: 'paperclipai/example-repo',
+        paperclipProjectName: 'Engineering',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1'
+      }
+    ],
+    syncState: {
+      status: 'idle'
+    },
+    paperclipApiBaseUrl: 'https://board.example.com'
+  });
+
+  const originalCreate = harness.ctx.issues.create;
+  const originalUpdate = harness.ctx.issues.update;
+
+  const directDescriptionUpdateCalls: Array<{ issueId: string; description: unknown }> = [];
+  harness.ctx.issues.update = async (issueId, patch, companyId) => {
+    if (patch && typeof patch === 'object' && 'description' in patch) {
+      directDescriptionUpdateCalls.push({
+        issueId,
+        description: (patch as { description?: unknown }).description
+      });
+    }
+
+    return originalUpdate(issueId, patch, companyId);
+  };
+
+  let createdIssueId: string | null = null;
+  const loginPage = '<!doctype html><html><body><h1>Sign in</h1></body></html>';
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (input, init) => {
+    const rawUrl = getRequestUrl(input);
+    const url = new URL(rawUrl);
+
+    if (url.pathname === '/api/companies/company-1/issues') {
+      const body = getJsonRequestBody(init);
+      const created = await originalCreate({
+        companyId: 'company-1',
+        projectId: 'project-1',
+        title: typeof body?.title === 'string' ? body.title : 'HTML login page fallback',
+      } as Parameters<typeof originalCreate>[0]);
+      createdIssueId = created.id;
+
+      return jsonResponse(created, 201);
+    }
+
+    if (createdIssueId && url.pathname === `/api/issues/${createdIssueId}`) {
+      return htmlResponse(loginPage);
+    }
+
+    if (url.pathname === '/repos/paperclipai/example-repo/issues' && ['all', 'open'].includes(url.searchParams.get('state') ?? '')) {
+      return jsonResponse([
+        {
+          id: 3101,
+          number: 31,
+          title: 'HTML login page fallback',
+          body: 'Description survives the HTML login page.',
+          html_url: 'https://github.com/paperclipai/example-repo/issues/31',
+          state: 'open',
+          comments: 0
+        }
+      ]);
+    }
+
+    if (url.pathname === '/graphql') {
+      const { query, variables } = getGraphqlRequest(init);
+      const issueNumber = typeof variables.issueNumber === 'number' ? variables.issueNumber : undefined;
+
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([
+          {
+            issueNumber: 31
+          }
+        ]);
+      }
+
+      if (query.includes('query GitHubIssueStatusSnapshot') && issueNumber === 31) {
+        return graphqlResponse({
+          repository: {
+            issue: {
+              number: 31,
+              state: 'OPEN',
+              stateReason: null,
+              comments: {
+                totalCount: 0
+              },
+              closedByPullRequestsReferences: {
+                pageInfo: {
+                  hasNextPage: false,
+                  endCursor: null
+                },
+                nodes: []
+              }
+            }
+          }
+        });
+      }
+    }
+
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  try {
+    const sync = await harness.performAction('sync.runNow', {
+      waitForCompletion: true
+    }) as {
+      syncState: { status: string };
+    };
+
+    assert.equal(sync.syncState.status, 'success');
+    assert.equal(directDescriptionUpdateCalls.length >= 1, true);
+    assert.ok(
+      directDescriptionUpdateCalls.some((call) =>
+        typeof call.description === 'string'
+        && call.description.includes('Description survives the HTML login page.')
+      )
+    );
+    assert.ok(
+      harness.logs.find((entry) =>
+        entry.level === 'warn'
+        && entry.message === 'Unable to update a Paperclip issue description through the local API. Falling back to direct issue mutation.'
+        && entry.meta?.status === 200
+        && entry.meta?.error === 'Expected JSON from the Paperclip issue update API but received an HTML sign-in page.'
+        && entry.meta?.updatePath === 'local_api'
+        && entry.meta?.githubIssueNumber === 31
+      )
+    );
+    assert.ok(
+      harness.logs.find((entry) =>
+        entry.level === 'info'
+        && entry.message === 'GitHub sync repaired a Paperclip issue description through the SDK bridge.'
+        && entry.meta?.updatePath === 'sdk'
+        && entry.meta?.githubIssueNumber === 31
+      )
+    );
+
+    const importedIssue = (await harness.ctx.issues.list({
+      companyId: 'company-1'
+    })).find((issue) => issue.title === 'HTML login page fallback');
+
+    assert.ok(importedIssue);
+    assert.match(importedIssue?.description ?? '', /Description survives the HTML login page\./);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -4701,6 +5386,181 @@ test('worker uses the local Paperclip issue PATCH API for status transitions whe
   }
 });
 
+test('worker falls back to the SDK bridge when the local Paperclip status PATCH returns an HTML sign-in page', async () => {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRef: 'github-secret-ref'
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+  harness.ctx.http.fetch = async () => {
+    throw new Error('Local Paperclip issue API calls should use direct worker fetch, not ctx.http.fetch.');
+  };
+
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      {
+        id: 'mapping-a',
+        repositoryUrl: 'paperclipai/example-repo',
+        paperclipProjectName: 'Engineering',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1'
+      }
+    ],
+    syncState: {
+      status: 'idle'
+    },
+    paperclipApiBaseUrl: 'https://board.example.com'
+  });
+
+  const originalUpdate = harness.ctx.issues.update;
+  const originalCreateComment = harness.ctx.issues.createComment;
+
+  const importedIssue = await harness.ctx.issues.create({
+    companyId: 'company-1',
+    projectId: 'project-1',
+    title: 'HTML login status fallback',
+    description: '* GitHub issue: [#42](https://github.com/paperclipai/example-repo/issues/42)\n\n---\n\nBody'
+  });
+  await originalUpdate(importedIssue.id, { status: 'in_progress' }, 'company-1');
+
+  await harness.ctx.state.set(
+    {
+      scopeKind: 'instance',
+      stateKey: 'paperclip-github-plugin-import-registry'
+    },
+    [
+      {
+        mappingId: 'mapping-a',
+        githubIssueId: 4201,
+        githubIssueNumber: 42,
+        paperclipIssueId: importedIssue.id,
+        importedAt: '2026-04-09T09:00:00.000Z',
+        lastSeenCommentCount: 1,
+        repositoryUrl: 'https://github.com/paperclipai/example-repo',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1'
+      }
+    ]
+  );
+
+  const directStatusUpdateCalls: Array<{ issueId: string; status: unknown }> = [];
+  harness.ctx.issues.update = async (issueId, patch, companyId) => {
+    if (patch && typeof patch === 'object' && 'status' in patch) {
+      directStatusUpdateCalls.push({
+        issueId,
+        status: (patch as { status?: unknown }).status
+      });
+    }
+
+    return originalUpdate(issueId, patch, companyId);
+  };
+
+  const directCommentCalls: Array<{ issueId: string; body: string }> = [];
+  harness.ctx.issues.createComment = async (issueId, body, companyId) => {
+    directCommentCalls.push({ issueId, body });
+    return originalCreateComment(issueId, body, companyId);
+  };
+
+  const patchRequests: Array<{ issueId: string; body: Record<string, unknown> | null }> = [];
+  const loginPage = '<!doctype html><html><body><h1>Sign in</h1></body></html>';
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (input, init) => {
+    const rawUrl = getRequestUrl(input);
+    const url = new URL(rawUrl);
+
+    if (url.pathname === `/api/issues/${importedIssue.id}`) {
+      patchRequests.push({
+        issueId: importedIssue.id,
+        body: getJsonRequestBody(init)
+      });
+      return htmlResponse(loginPage);
+    }
+
+    if (url.pathname === '/repos/paperclipai/example-repo/issues' && ['all', 'open'].includes(url.searchParams.get('state') ?? '')) {
+      return jsonResponse([
+        {
+          id: 4201,
+          number: 42,
+          title: 'HTML login status fallback',
+          body: 'Body',
+          html_url: 'https://github.com/paperclipai/example-repo/issues/42',
+          state: 'open',
+          comments: 2
+        }
+      ]);
+    }
+
+    if (url.pathname === '/graphql') {
+      const { query, variables } = getGraphqlRequest(init);
+      const issueNumber = typeof variables.issueNumber === 'number' ? variables.issueNumber : undefined;
+
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([
+          {
+            issueNumber: 42
+          }
+        ]);
+      }
+
+      if (query.includes('query GitHubIssueStatusSnapshot') && issueNumber === 42) {
+        return graphqlResponse({
+          repository: {
+            issue: {
+              number: 42,
+              state: 'OPEN',
+              stateReason: null,
+              comments: {
+                totalCount: 2
+              },
+              closedByPullRequestsReferences: {
+                pageInfo: {
+                  hasNextPage: false,
+                  endCursor: null
+                },
+                nodes: []
+              }
+            }
+          }
+        });
+      }
+    }
+
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  try {
+    const sync = await harness.performAction('sync.runNow', {
+      waitForCompletion: true
+    }) as {
+      syncState: { status: string };
+    };
+
+    assert.equal(sync.syncState.status, 'success');
+    const statusPatchRequests = patchRequests.filter((request) => typeof request.body?.status === 'string');
+    assert.equal(statusPatchRequests.length, 1);
+    assert.equal(statusPatchRequests[0]?.body?.status, 'todo');
+    assert.equal(directStatusUpdateCalls.length, 1);
+    assert.equal(directStatusUpdateCalls[0]?.status, 'todo');
+    assert.equal(directCommentCalls.length, 1);
+    assert.ok(
+      harness.logs.find((entry) =>
+        entry.level === 'warn'
+        && entry.message === 'Unable to update a Paperclip issue status through the local API. Falling back to direct issue mutation.'
+        && entry.meta?.status === 200
+        && entry.meta?.error === 'Expected JSON from the Paperclip issue update API but received an HTML sign-in page.'
+      )
+    );
+
+    const updatedIssue = await harness.ctx.issues.get(importedIssue.id, 'company-1');
+    assert.equal(updatedIssue?.status, 'todo');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('worker stores repository and issue diagnostics when a sync fails mid-run', async () => {
   const harness = createTestHarness({
     manifest,
@@ -4882,6 +5742,85 @@ test('sync.runNow falls back to the saved githubTokenRef when config has not pro
   assert.equal(result.syncState.status, 'error');
   assert.equal(result.syncState.message, 'Save at least one mapping with a created Paperclip project before running sync.');
   assert.equal(result.syncState.lastRunTrigger, 'manual');
+});
+
+test('worker blocks sync when the Paperclip deployment is authenticated and board access is missing', async () => {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRef: 'github-secret-ref'
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      {
+        id: 'mapping-a',
+        repositoryUrl: 'paperclipai/example-repo',
+        paperclipProjectName: 'Engineering',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1'
+      }
+    ],
+    syncState: {
+      status: 'idle'
+    }
+  });
+
+  harness.ctx.secrets.resolve = async (secretRef) => {
+    assert.equal(secretRef, 'github-secret-ref');
+    return 'github-token';
+  };
+
+  const originalFetch = globalThis.fetch;
+  const requestedUrls: string[] = [];
+
+  globalThis.fetch = async (input) => {
+    const url = getRequestUrl(input);
+    requestedUrls.push(url);
+
+    if (url === 'https://paperclip.example.test/api/health') {
+      return jsonResponse({
+        deploymentMode: 'authenticated',
+        deploymentExposure: 'public',
+        authReady: true
+      });
+    }
+
+    throw new Error(`GitHub sync should have been blocked before reaching ${url}`);
+  };
+
+  try {
+    const result = await harness.performAction('sync.runNow', {
+      waitForCompletion: true,
+      paperclipApiBaseUrl: 'https://paperclip.example.test'
+    }) as {
+      syncState: {
+        status: string;
+        message?: string;
+        lastRunTrigger?: string;
+        errorDetails?: {
+          phase?: string;
+          configurationIssue?: string;
+          suggestedAction?: string;
+        };
+      };
+    };
+
+    assert.equal(result.syncState.status, 'error');
+    assert.equal(
+      result.syncState.message,
+      'Connect Paperclip board access before running sync on this authenticated deployment.'
+    );
+    assert.equal(result.syncState.lastRunTrigger, 'manual');
+    assert.equal(result.syncState.errorDetails?.phase, 'configuration');
+    assert.equal(result.syncState.errorDetails?.configurationIssue, 'missing_board_access');
+    assert.match(result.syncState.errorDetails?.suggestedAction ?? '', /connect Paperclip board access/i);
+    assert.deepEqual(requestedUrls, ['https://paperclip.example.test/api/health']);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('settings registration clears legacy setup errors once the missing token is saved', async () => {

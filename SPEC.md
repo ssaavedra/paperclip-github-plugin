@@ -7,6 +7,7 @@ GitHub Sync is a Paperclip plugin for registering one or more GitHub repositorie
 The plugin MUST provide a settings page inside Paperclip where an operator can configure:
 
 - a GitHub token stored as a Paperclip secret reference
+- Paperclip board access, which is optional on unauthenticated deployments and required when the Paperclip deployment reports `deploymentMode: "authenticated"`
 - one or more GitHub repository mappings
 - the frequency for automatic scheduled sync runs
 - a Paperclip project name per mapping where synchronized issues should be created
@@ -14,6 +15,7 @@ The plugin MUST provide a settings page inside Paperclip where an operator can c
 The settings page MUST allow saving mappings and triggering a manual sync.
 - The plugin SHOULD also expose manual sync entry points from Paperclip toolbar surfaces when the SDK supports them.
 - When a manual sync will outlive a quick action response, the worker MUST persist a `running` sync state immediately and complete the sync asynchronously.
+- The settings page, dashboard widget, and sync toolbar surfaces SHOULD detect authenticated deployments from `/api/health` and MUST require connected Paperclip board access before enabling sync for the affected company.
 
 ## Secret handling
 
@@ -21,6 +23,9 @@ The settings page MUST allow saving mappings and triggering a manual sync.
 - Saving a token from the settings UI MUST create or reuse a company secret through the Paperclip host API.
 - The plugin MUST persist only the resulting secret UUID in plugin instance config.
 - The worker MUST resolve that secret UUID at runtime via `ctx.secrets.resolve(...)`.
+- The raw Paperclip board API token MUST NOT be persisted in plugin state.
+- Connecting Paperclip board access from the settings UI MUST create or reuse a company secret through the Paperclip host API and MUST persist only the resulting secret UUID, keyed by company in plugin state and mirrored into plugin instance config so the worker can resolve it.
+- The worker MUST resolve the saved Paperclip board token secret at runtime via `ctx.secrets.resolve(...)` before making direct Paperclip REST calls for that company, and MUST treat plugin config as the worker-readable source of truth for those secret refs.
 
 ## Synchronization behavior
 
@@ -37,8 +42,12 @@ The plugin MUST persist repository mappings and sync state in plugin state.
 - GitHub repository, issue, PR, label, and sync metadata SHOULD move into a dedicated issue detail surface instead of being prepended into the issue description.
 - Repeated sync runs MUST continue reconciling imported Paperclip issue descriptions against the latest GitHub issue body.
 - Saving setup MUST persist the current Paperclip host origin so scheduled sync runs can call the local Paperclip label API later.
+- When the worker is configured with a runtime `PAPERCLIP_API_URL`, that worker-accessible API origin MUST take precedence over the UI-saved host origin for local Paperclip REST calls.
+- Before a manual or scheduled sync touches any mapping whose company is missing board access, the worker MUST probe `/api/health` on the resolved Paperclip API origin and fail fast with configuration guidance when that deployment reports `deploymentMode: "authenticated"`.
+- When a company has connected Paperclip board access, the worker MUST attach `Authorization: Bearer <board-token>` to direct Paperclip REST issue and label calls for that company.
 - When the Paperclip runtime exposes existing issue labels for the target company, the sync flow MUST map GitHub labels onto matching Paperclip labels by name and SHOULD prefer an exact color match when multiple Paperclip labels share the same name.
 - When no matching Paperclip label exists and the local Paperclip label API is reachable, the sync flow MUST create the missing Paperclip label using the GitHub label color when available before attaching it to the imported issue.
+- When a local Paperclip REST call returns an unexpected non-JSON success payload, such as an authenticated HTML sign-in page, the worker MUST treat that response as unavailable, fall back to SDK-based issue mutation when possible, and surface an actionable sync error that points operators to Paperclip board access or `PAPERCLIP_API_URL` when labels still cannot be reconciled.
 - Repeated sync runs MUST skip recreating issues that were already imported for the same mapping.
 - If the plugin-owned import registry is stale or missing, repeated sync runs MUST repair deduplication by reusing an existing imported Paperclip issue in the mapped project when durable GitHub link metadata or, for legacy issues, the description source link matches the GitHub issue URL.
 - Repeated sync runs MUST continue reconciling imported Paperclip issue statuses against the latest GitHub state.

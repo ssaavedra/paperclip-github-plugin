@@ -2,7 +2,7 @@
 
 GitHub Sync is a Paperclip plugin that connects GitHub repositories to Paperclip projects and keeps GitHub issues synchronized into your Paperclip workspace.
 
-It is designed for teams that plan in Paperclip but still receive work through GitHub issues. The plugin gives you a Paperclip-native setup flow, secure GitHub token handling through Paperclip secrets, manual sync controls, automatic background sync, and GitHub context directly on synced Paperclip issues.
+It is designed for teams that plan in Paperclip but still receive work through GitHub issues. The plugin gives you a Paperclip-native setup flow, secure GitHub token handling through Paperclip secrets, authenticated-deployment detection with required board-access connection when needed, manual sync controls, automatic background sync, and GitHub context directly on synced Paperclip issues.
 
 ## What the plugin does
 
@@ -10,6 +10,7 @@ It is designed for teams that plan in Paperclip but still receive work through G
 - Imports GitHub issues as top-level Paperclip issues.
 - Keeps already imported issues updated instead of recreating them.
 - Stores the GitHub token as a Paperclip secret reference instead of persisting the raw token in plugin state.
+- Can store a per-company Paperclip board API token for worker-side REST calls when Paperclip board access requires sign-in.
 - Adds Paperclip UI surfaces for setup, sync status, manual sync actions, issue details, and GitHub link annotations.
 
 ## User-facing features
@@ -19,6 +20,9 @@ It is designed for teams that plan in Paperclip but still receive work through G
 - Hosted settings page inside Paperclip.
 - GitHub token validation before saving.
 - GitHub token saved through Paperclip company secrets; the plugin stores only the secret reference.
+- Automatic detection of authenticated Paperclip deployments through `/api/health`.
+- Paperclip board access connection flow from settings, enforced when the deployment requires authenticated board access for worker-side REST calls.
+- Paperclip board tokens saved through Paperclip company secrets per company; the plugin stores only the secret reference and mirrors that ref into plugin config so workers can resolve it during sync.
 - Support for multiple repository-to-project mappings.
 - Repository input accepts either `owner/repo` or `https://github.com/owner/repo`.
 - Automatic creation or reuse of the target Paperclip project when a mapping is saved.
@@ -81,9 +85,12 @@ It is designed for teams that plan in Paperclip but still receive work through G
 ### Resilience and safety
 
 - Raw GitHub tokens are never persisted in plugin state.
+- Raw Paperclip board tokens are never persisted in plugin state or plugin config.
 - Scheduled sync skips runs that are not due yet.
 - Incomplete setup is surfaced as configuration guidance instead of silently failing.
+- Authenticated deployments are detected before sync starts, and the plugin blocks sync until the required company board access has been connected.
 - GitHub rate limiting pauses sync until the reported reset time and prevents pointless retries while the pause is active.
+- Direct Paperclip REST label and issue calls attach the saved board token automatically when one has been connected for the mapping company.
 - Sync failures retain repository and issue diagnostics to make troubleshooting easier.
 
 ## Paperclip surfaces added by this plugin
@@ -118,11 +125,12 @@ If you are installing into an isolated local Paperclip instance for testing, inc
 1. Open Paperclip instance settings and go to the plugin settings for **GitHub Sync**.
 2. Paste a GitHub token and validate it.
 3. Save the validated token so Paperclip can store it as a secret reference.
-4. Add one or more repository mappings.
-5. For each mapping, enter a GitHub repository and the Paperclip project name that should receive synced issues.
-6. Choose the automatic sync interval in minutes.
-7. Save the settings.
-8. Run a manual sync to import the first batch of issues.
+4. If the settings page reports that this Paperclip deployment requires board access, connect **Paperclip board access** from the same settings page and approve the new tab that opens.
+5. Add one or more repository mappings.
+6. For each mapping, enter a GitHub repository and the Paperclip project name that should receive synced issues.
+7. Choose the automatic sync interval in minutes.
+8. Save the settings.
+9. Run a manual sync to import the first batch of issues.
 
 ## Expected workflow
 
@@ -132,8 +140,10 @@ Imported issues stay linked to GitHub and continue to receive description, label
 
 ## Troubleshooting notes
 
-- If sync says setup is incomplete, confirm that a validated token has been saved and at least one repository mapping has a created Paperclip project.
+- If sync says setup is incomplete, confirm that a validated token has been saved, at least one repository mapping has a created Paperclip project, and authenticated deployments have connected Paperclip board access for the current company.
 - If token validation fails, confirm the token is still valid and can access the target repositories through the GitHub API.
+- If the dashboard, toolbar, or settings page says board access is required, open plugin settings inside the target company and complete the Paperclip board access approval flow before retrying sync.
+- If sync reports that the Paperclip API returned an authenticated HTML page instead of JSON, the worker is reaching a board URL that requires the browser login session. Connect Paperclip board access from plugin settings for that company, or set `PAPERCLIP_API_URL` for the Paperclip worker to a worker-accessible Paperclip API origin, then rerun sync.
 - If GitHub rate limiting is hit, the plugin pauses sync until the reset time shown in Paperclip.
 - If a sync takes longer than a quick action window, the plugin continues in the background and updates the UI when it finishes.
 - If older imported issues are missing rich GitHub metadata, run sync once to refresh the link, labels, and pull request details.

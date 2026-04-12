@@ -42,8 +42,14 @@ export const manifest: PaperclipPluginManifestV1 = {
     properties: {
       githubTokenRef: {
         type: 'string',
-        title: 'GitHub Token Secret',
-        format: 'secret-ref'
+        title: 'GitHub Token Secret'
+      },
+      paperclipBoardApiTokenRefs: {
+        type: 'object',
+        title: 'Paperclip Board Token Secrets',
+        additionalProperties: {
+          type: 'string'
+        }
       }
     }
   },
