@@ -6940,7 +6940,21 @@ test('worker issue.githubDetails returns issue-scoped GitHub detail payloads', a
       githubIssueState: 'closed',
       githubIssueStateReason: 'completed',
       commentsCount: 4,
-      linkedPullRequestNumbers: [2020, 2021],
+      linkedPullRequestNumbers: [2021, 2020, 2021],
+      linkedPullRequests: [
+        {
+          number: 2021,
+          repositoryUrl: 'https://github.com/paperclipai/zeta-repo'
+        },
+        {
+          number: 2020,
+          repositoryUrl: ' paperclipai/alpha-repo '
+        },
+        {
+          number: 2021,
+          repositoryUrl: 'paperclipai/zeta-repo'
+        }
+      ],
       labels: [],
       syncedAt: '2026-04-10T09:00:00.000Z'
     }
@@ -6958,6 +6972,10 @@ test('worker issue.githubDetails returns issue-scoped GitHub detail payloads', a
     paperclipIssueId: string;
     githubIssueNumber: number;
     linkedPullRequestNumbers: number[];
+    linkedPullRequests?: Array<{
+      number: number;
+      repositoryUrl: string;
+    }>;
     creator?: {
       name: string;
       handle: string;
@@ -6975,6 +6993,16 @@ test('worker issue.githubDetails returns issue-scoped GitHub detail payloads', a
   assert.equal(secondDetails?.paperclipIssueId, secondIssue.id);
   assert.equal(secondDetails?.githubIssueNumber, 202);
   assert.deepEqual(secondDetails?.linkedPullRequestNumbers, [2020, 2021]);
+  assert.deepEqual(secondDetails?.linkedPullRequests, [
+    {
+      number: 2020,
+      repositoryUrl: 'https://github.com/paperclipai/alpha-repo'
+    },
+    {
+      number: 2021,
+      repositoryUrl: 'https://github.com/paperclipai/zeta-repo'
+    }
+  ]);
   assert.deepEqual(secondDetails?.creator, {
     name: 'octocat',
     handle: '@octocat',
@@ -14485,11 +14513,11 @@ test('worker routes reviewer, approver, and executor fallback handoffs to a boar
   }
 });
 
-test('worker ignores linked pull requests from other repositories', async () => {
+test('worker handles linked pull requests from other repositories', async () => {
   const harness = createTestHarness({
     manifest,
     config: {
-      githubTokenRef: 'github-secret-ref'
+      githubToken: 'ghp_test_token'
     }
   });
   await plugin.definition.setup(harness.ctx);
@@ -14514,7 +14542,7 @@ test('worker ignores linked pull requests from other repositories', async () => 
   const importedIssue = await harness.ctx.issues.create({
     companyId: 'company-1',
     projectId: 'project-1',
-    title: 'Ignore foreign linked PRs'
+    title: 'Handle foreign linked PRs'
   });
   await originalUpdate(importedIssue.id, { status: 'todo' }, 'company-1');
 
@@ -14556,7 +14584,7 @@ test('worker ignores linked pull requests from other repositories', async () => 
         {
           id: 923001,
           number: 923,
-          title: 'Ignore foreign linked PRs',
+          title: 'Handle foreign linked PRs',
           body: 'Body',
           html_url: 'https://github.com/paperclipai/paperclip/issues/923',
           state: 'open',
@@ -14565,11 +14593,39 @@ test('worker ignores linked pull requests from other repositories', async () => 
       ]);
     }
 
+    if (url.pathname === '/repos/hooji/paperclip/pulls/1') {
+      return jsonResponse({
+        number: 1,
+        title: 'Fix linked issue from another repository',
+        body: 'Fixes the imported GitHub issue.',
+        html_url: 'https://github.com/hooji/paperclip/pull/1',
+        state: 'open',
+        draft: false,
+        merged: false,
+        mergeable: true,
+        mergeable_state: 'clean',
+        head: {
+          ref: 'feature/cross-repo-link',
+          sha: 'abc123'
+        },
+        base: {
+          ref: 'main'
+        },
+        user: {
+          login: 'octocat'
+        },
+        requested_reviewers: [],
+        requested_teams: []
+      });
+    }
+
     if (url.pathname === '/graphql') {
       const { query, variables } = getGraphqlRequest(init);
       const issueNumber = typeof variables.issueNumber === 'number' ? variables.issueNumber : undefined;
       const pullRequestNumber =
         typeof variables.pullRequestNumber === 'number' ? variables.pullRequestNumber : undefined;
+      const owner = typeof variables.owner === 'string' ? variables.owner : undefined;
+      const repo = typeof variables.repo === 'string' ? variables.repo : undefined;
 
       if (query.includes('query GitHubIssueParentRelationships')) {
         return graphqlIssueParentRelationshipsResponse([
@@ -14579,7 +14635,12 @@ test('worker ignores linked pull requests from other repositories', async () => 
         ]);
       }
 
-      if (query.includes('query GitHubIssueStatusSnapshot') && issueNumber === 923) {
+      if (
+        query.includes('query GitHubIssueStatusSnapshot') &&
+        issueNumber === 923 &&
+        owner === 'paperclipai' &&
+        repo === 'paperclip'
+      ) {
         return graphqlResponse({
           repository: {
             issue: {
@@ -14595,16 +14656,6 @@ test('worker ignores linked pull requests from other repositories', async () => 
                   endCursor: null
                 },
                 nodes: [
-                  {
-                    number: 1977,
-                    state: 'OPEN',
-                    repository: {
-                      owner: {
-                        login: 'paperclipai'
-                      },
-                      name: 'paperclip'
-                    }
-                  },
                   {
                     number: 1,
                     state: 'OPEN',
@@ -14622,7 +14673,12 @@ test('worker ignores linked pull requests from other repositories', async () => 
         });
       }
 
-      if (query.includes('query GitHubPullRequestReviewThreads') && pullRequestNumber === 1977) {
+      if (
+        query.includes('query GitHubPullRequestReviewThreads') &&
+        pullRequestNumber === 1 &&
+        owner === 'hooji' &&
+        repo === 'paperclip'
+      ) {
         return graphqlResponse({
           repository: {
             pullRequest: {
@@ -14638,7 +14694,12 @@ test('worker ignores linked pull requests from other repositories', async () => 
         });
       }
 
-      if (query.includes('query GitHubPullRequestCiContexts') && pullRequestNumber === 1977) {
+      if (
+        query.includes('query GitHubPullRequestCiContexts') &&
+        pullRequestNumber === 1 &&
+        owner === 'hooji' &&
+        repo === 'paperclip'
+      ) {
         return graphqlResponse({
           repository: {
             pullRequest: {
@@ -14678,7 +14739,7 @@ test('worker ignores linked pull requests from other repositories', async () => 
     assert.equal(updatedIssue?.status, 'in_review');
     assert.equal(statusTransitionComments.length, 1);
     assert.match(statusTransitionComments[0]?.body ?? '', /the linked pull request has green CI with all review threads resolved/);
-    assert.doesNotMatch(statusTransitionComments[0]?.body ?? '', /paperclipai\/paperclip#1977|paperclipai\/paperclip#1\b/);
+    assert.doesNotMatch(statusTransitionComments[0]?.body ?? '', /paperclipai\/paperclip#923|hooji\/paperclip#1\b/);
 
     const annotation = await harness.getData<{
       links: Array<{ label: string; href: string }>;
@@ -14696,10 +14757,37 @@ test('worker ignores linked pull requests from other repositories', async () => 
       },
       {
         type: 'pull_request',
-        label: 'PR #1977',
-        href: 'https://github.com/paperclipai/paperclip/pull/1977'
+        label: 'hooji/paperclip#1',
+        href: 'https://github.com/hooji/paperclip/pull/1'
       }
     ]);
+
+    const githubDetails = await harness.getData<{
+      linkedPullRequestNumbers: number[];
+      linkedPullRequests?: Array<{ number: number; repositoryUrl: string }>;
+    } | null>('issue.githubDetails', {
+      companyId: 'company-1',
+      issueId: importedIssue.id
+    });
+
+    assert.deepEqual(githubDetails?.linkedPullRequestNumbers, [1]);
+    assert.deepEqual(githubDetails?.linkedPullRequests, [
+      {
+        number: 1,
+        repositoryUrl: 'https://github.com/hooji/paperclip'
+      }
+    ]);
+
+    const inferredPullRequest = await harness.executeTool('get_pull_request', {
+      paperclipIssueId: importedIssue.id
+    }, {
+      companyId: 'company-1',
+      projectId: 'project-1'
+    });
+
+    assert.ok(!inferredPullRequest.error);
+    assert.equal((inferredPullRequest.data as { repository: string }).repository, 'https://github.com/hooji/paperclip');
+    assert.equal((inferredPullRequest.data as { pullRequest: { number: number } }).pullRequest.number, 1);
   } finally {
     globalThis.fetch = originalFetch;
   }
