@@ -2121,7 +2121,18 @@ function formatGitHubIssueCountLabel(count: number): string {
 }
 
 function getErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  if (error && typeof error === 'object' && 'message' in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === 'string') {
+      return message;
+    }
+  }
+
+  return String(error);
 }
 
 function isPaperclipLabelSyncError(error: unknown): error is PaperclipLabelSyncError {
@@ -7348,6 +7359,16 @@ function hasUnresolvedPaperclipIssueBlockerSummary(blockers: unknown): boolean {
   });
 }
 
+function isMissingIssueRelationsReadCapabilityError(error: unknown): boolean {
+  const message = getErrorMessage(error);
+
+  return (
+    /missing required capability/i.test(message)
+    && /issue\.relations\.read/i.test(message)
+    && /issues\.relations\.get/i.test(message)
+  );
+}
+
 async function hasUnresolvedPaperclipIssueBlocker(
   ctx: PluginSetupContext,
   issue: Issue,
@@ -7362,8 +7383,16 @@ async function hasUnresolvedPaperclipIssueBlocker(
     return false;
   }
 
-  const relations = await ctx.issues.relations.get(issue.id, companyId);
-  return hasUnresolvedPaperclipIssueBlockerSummary(relations.blockedBy);
+  try {
+    const relations = await ctx.issues.relations.get(issue.id, companyId);
+    return hasUnresolvedPaperclipIssueBlockerSummary(relations.blockedBy);
+  } catch (error) {
+    if (isMissingIssueRelationsReadCapabilityError(error)) {
+      return false;
+    }
+
+    throw error;
+  }
 }
 
 function isSamePaperclipIssueAssigneePrincipal(
@@ -20069,6 +20098,7 @@ export function shouldStartWorkerHost(moduleUrl: string, entry = process.argv[1]
 
 export const __testing = {
   buildSyncFallbackExecutionStatePatch,
+  hasUnresolvedPaperclipIssueBlocker,
   isHealthyMaintainerWaitTransition,
   resolveSyncTransitionAssignee
 };

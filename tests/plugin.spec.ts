@@ -131,6 +131,86 @@ test('sync still starts internal review for active implementation handoffs', asy
   );
 });
 
+test('issue blocker relation checks tolerate stale host capability denials', async () => {
+  const workerModule = await importFreshWorkerModule();
+  const testing = workerModule.__testing as typeof workerModule.__testing & {
+    hasUnresolvedPaperclipIssueBlocker?: (
+      ctx: unknown,
+      issue: { id: string; blockedBy?: unknown },
+      companyId: string
+    ) => Promise<boolean>;
+  };
+
+  assert.equal(typeof testing.hasUnresolvedPaperclipIssueBlocker, 'function');
+
+  const isBlocked = await testing.hasUnresolvedPaperclipIssueBlocker(
+    {
+      issues: {
+        relations: {
+          get: async () => {
+            throw new Error(
+              'Plugin "d5344f69-c969-457c-89c0-ed7608f3703b" is missing required capability "issue.relations.read" for method "issues.relations.get"'
+            );
+          }
+        }
+      }
+    },
+    { id: 'issue-12' },
+    'company-1'
+  );
+
+  assert.equal(isBlocked, false);
+
+  const isBlockedFromObjectError = await testing.hasUnresolvedPaperclipIssueBlocker(
+    {
+      issues: {
+        relations: {
+          get: async () => {
+            throw {
+              message:
+                'Plugin "d5344f69-c969-457c-89c0-ed7608f3703b" is missing required capability "issue.relations.read" for method "issues.relations.get"'
+            };
+          }
+        }
+      }
+    },
+    { id: 'issue-12' },
+    'company-1'
+  );
+
+  assert.equal(isBlockedFromObjectError, false);
+});
+
+test('issue blocker relation checks propagate unrelated relation read failures', async () => {
+  const workerModule = await importFreshWorkerModule();
+  const testing = workerModule.__testing as typeof workerModule.__testing & {
+    hasUnresolvedPaperclipIssueBlocker?: (
+      ctx: unknown,
+      issue: { id: string; blockedBy?: unknown },
+      companyId: string
+    ) => Promise<boolean>;
+  };
+
+  assert.equal(typeof testing.hasUnresolvedPaperclipIssueBlocker, 'function');
+
+  await assert.rejects(
+    testing.hasUnresolvedPaperclipIssueBlocker(
+      {
+        issues: {
+          relations: {
+            get: async () => {
+              throw new Error('Paperclip relation storage is unavailable.');
+            }
+          }
+        }
+      },
+      { id: 'issue-12' },
+      'company-1'
+    ),
+    /relation storage is unavailable/
+  );
+});
+
 async function importManifestWithPluginVersion(pluginVersion?: string): Promise<typeof manifest> {
   const previousPluginVersion = process.env.PLUGIN_VERSION;
   const manifestModuleUrl = new URL(
