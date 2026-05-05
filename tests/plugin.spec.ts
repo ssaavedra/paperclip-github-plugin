@@ -6399,6 +6399,222 @@ test('sync.runNow keeps directly linked pull request issues in review when only 
   }
 });
 
+test('sync.runNow preserves manually closed directly linked pull request issue workflow metadata while the pull request remains open', async () => {
+  const harness = await createProjectPullRequestsHarness();
+  const originalFetch = globalThis.fetch;
+  const originalUpdate = harness.ctx.issues.update;
+  const issue = await harness.ctx.issues.create({
+    companyId: 'company-1',
+    projectId: 'project-1',
+    title: 'Manually closed PR link',
+    description: 'This Paperclip issue was closed manually while the GitHub PR is still open.'
+  });
+
+  await harness.ctx.entities.upsert({
+    entityType: 'paperclip-github-plugin.pull-request-link',
+    scopeKind: 'issue',
+    scopeId: issue.id,
+    externalId: 'https://github.com/paperclipai/example-repo/pull/44',
+    title: 'GitHub pull request #44',
+    status: 'open',
+    data: {
+      companyId: 'company-1',
+      paperclipProjectId: 'project-1',
+      repositoryUrl: 'https://github.com/paperclipai/example-repo',
+      githubPullRequestNumber: 44,
+      githubPullRequestUrl: 'https://github.com/paperclipai/example-repo/pull/44',
+      githubPullRequestState: 'open',
+      title: 'Manually closed PR link',
+      syncedAt: '2026-04-27T09:30:00.000Z'
+    }
+  });
+  await originalUpdate(issue.id, {
+    status: 'done',
+    assigneeAgentId: 'agent-3',
+    executionPolicy: {
+      mode: 'normal',
+      commentRequired: true,
+      stages: [
+        {
+          id: 'review-stage',
+          type: 'review',
+          participants: [{ type: 'agent', agentId: 'agent-2' }]
+        }
+      ]
+    },
+    executionState: {
+      status: 'pending',
+      currentStageId: 'review-stage',
+      currentStageIndex: 0,
+      currentStageType: 'review',
+      currentParticipant: { type: 'agent', agentId: 'agent-2' },
+      returnAssignee: { type: 'agent', agentId: 'agent-1' },
+      completedStageIds: []
+    }
+  } as never, 'company-1');
+
+  const directStatusUpdateCalls: Array<{ issueId: string; patch: Record<string, unknown> }> = [];
+  harness.ctx.issues.update = async (issueId, patch, companyId) => {
+    if (issueId === issue.id && patch && typeof patch === 'object' && 'status' in patch) {
+      directStatusUpdateCalls.push({
+        issueId,
+        patch: (patch ?? {}) as Record<string, unknown>
+      });
+    }
+
+    return originalUpdate(issueId, patch, companyId);
+  };
+
+  globalThis.fetch = async (input, init) => {
+    const requestUrl = getRequestUrl(input);
+    const requestPathname = getDecodedRequestPathname(input);
+
+    if (requestPathname === '/repos/paperclipai/example-repo/issues') {
+      return jsonResponse([]);
+    }
+
+    if (requestPathname === '/repos/paperclipai/example-repo/pulls/44') {
+      return jsonResponse({
+        number: 44,
+        title: 'Manually closed PR link',
+        body: 'GitHub PR is still open.',
+        html_url: 'https://github.com/paperclipai/example-repo/pull/44',
+        state: 'open',
+        merged: false
+      });
+    }
+
+    if (requestPathname === '/graphql') {
+      const { query, variables } = getGraphqlRequest(init);
+      const pullRequestNumber =
+        typeof variables.pullRequestNumber === 'number' ? variables.pullRequestNumber : undefined;
+
+      if (query.includes('query GitHubRepositoryOpenIssueLinkedPullRequests')) {
+        return graphqlResponse({
+          repository: {
+            issues: {
+              pageInfo: {
+                hasNextPage: false,
+                endCursor: null
+              },
+              nodes: []
+            }
+          }
+        });
+      }
+
+      if (query.includes('query GitHubRepositoryOpenPullRequestStatuses')) {
+        return graphqlResponse({
+          repository: {
+            pullRequests: {
+              pageInfo: {
+                hasNextPage: false,
+                endCursor: null
+              },
+              nodes: [
+                {
+                  number: 44,
+                  mergeable: 'MERGEABLE',
+                  mergeStateStatus: 'CLEAN',
+                  reviewDecision: null,
+                  reviewThreads: {
+                    pageInfo: {
+                      hasNextPage: false,
+                      endCursor: null
+                    },
+                    nodes: []
+                  },
+                  statusCheckRollup: {
+                    contexts: {
+                      pageInfo: {
+                        hasNextPage: false,
+                        endCursor: null
+                      },
+                      nodes: [
+                        {
+                          __typename: 'StatusContext',
+                          state: 'SUCCESS'
+                        }
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        });
+      }
+
+      if (query.includes('query GitHubPullRequestReviewThreads') && pullRequestNumber === 44) {
+        return graphqlResponse({
+          repository: {
+            pullRequest: {
+              reviewThreads: {
+                pageInfo: {
+                  hasNextPage: false,
+                  endCursor: null
+                },
+                nodes: []
+              }
+            }
+          }
+        });
+      }
+
+      if (query.includes('query GitHubPullRequestCiContexts') && pullRequestNumber === 44) {
+        return graphqlResponse({
+          repository: {
+            pullRequest: {
+              mergeable: 'MERGEABLE',
+              mergeStateStatus: 'CLEAN',
+              reviewDecision: null,
+              statusCheckRollup: {
+                contexts: {
+                  pageInfo: {
+                    hasNextPage: false,
+                    endCursor: null
+                  },
+                  nodes: [
+                    {
+                      __typename: 'StatusContext',
+                      state: 'SUCCESS'
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        });
+      }
+    }
+
+    throw new Error(`Unexpected fetch during manually closed PR link sync test: ${requestUrl}`);
+  };
+
+  try {
+    const sync = await harness.performAction('sync.runNow', {
+      companyId: 'company-1',
+      issueId: issue.id,
+      waitForCompletion: true
+    }) as {
+      syncState: { status: string; syncedIssuesCount?: number };
+    };
+
+    assert.equal(sync.syncState.status, 'success');
+    assert.equal(sync.syncState.syncedIssuesCount, 1);
+    assert.equal(directStatusUpdateCalls.length, 0);
+
+    const updatedIssue = await harness.ctx.issues.get(issue.id, 'company-1') as Record<string, any> | null;
+    assert.equal(updatedIssue?.status, 'done');
+    assert.equal(updatedIssue?.assigneeAgentId, 'agent-3');
+    assert.notEqual(updatedIssue?.executionPolicy ?? null, null);
+    assert.notEqual(updatedIssue?.executionState ?? null, null);
+  } finally {
+    harness.ctx.issues.update = originalUpdate;
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('project.pullRequests.updateBranch requests a GitHub branch update for behind clean pull requests', async () => {
   const harness = await createProjectPullRequestsHarness();
   const originalFetch = globalThis.fetch;
@@ -16625,24 +16841,58 @@ test('worker routes non-review-ready GitHub merge state statuses back to active 
       githubIssueId: 4501,
       githubIssueNumber: 45,
       pullRequestNumber: 450,
+      title: 'Blocked merge requirements with pending checks',
+      initialStatus: 'blocked' as const,
+      mergeable: 'UNKNOWN' as const,
+      mergeStateStatus: 'BLOCKED',
+      ciContexts: [
+        {
+          __typename: 'CheckRun',
+          status: 'IN_PROGRESS',
+          conclusion: null
+        }
+      ],
+      expectedStatus: 'blocked' as const
+    },
+    {
+      githubIssueId: 4601,
+      githubIssueNumber: 46,
+      pullRequestNumber: 460,
+      title: 'Unstable merge requirements with pending checks',
+      initialStatus: 'blocked' as const,
+      mergeable: 'UNKNOWN' as const,
+      mergeStateStatus: 'UNSTABLE',
+      ciContexts: [
+        {
+          __typename: 'CheckRun',
+          status: 'QUEUED',
+          conclusion: null
+        }
+      ],
+      expectedStatus: 'blocked' as const
+    },
+    {
+      githubIssueId: 4701,
+      githubIssueNumber: 47,
+      pullRequestNumber: 470,
       title: 'Unknown mergeability',
       mergeable: 'UNKNOWN' as const,
       mergeStateStatus: 'UNKNOWN',
       expectedStatus: 'in_review' as const
     },
     {
-      githubIssueId: 4601,
-      githubIssueNumber: 46,
-      pullRequestNumber: 460,
+      githubIssueId: 4801,
+      githubIssueNumber: 48,
+      pullRequestNumber: 480,
       title: 'Merge state still resolving',
       mergeable: 'MERGEABLE' as const,
       mergeStateStatus: 'UNKNOWN',
       expectedStatus: 'in_review' as const
     },
     {
-      githubIssueId: 4701,
-      githubIssueNumber: 47,
-      pullRequestNumber: 470,
+      githubIssueId: 4901,
+      githubIssueNumber: 49,
+      pullRequestNumber: 490,
       title: 'Completed merge state still resolving',
       initialStatus: 'done' as const,
       mergeable: 'MERGEABLE' as const,
@@ -16780,7 +17030,7 @@ test('worker routes non-review-ready GitHub merge state statuses back to active 
                     hasNextPage: false,
                     endCursor: null
                   },
-                  nodes: [
+                  nodes: scenario.ciContexts ?? [
                     {
                       __typename: 'StatusContext',
                       state: 'SUCCESS'
@@ -19093,8 +19343,15 @@ test('worker clears pending review and approval execution state before closing a
           }, 422);
         }
 
+        if (!Object.prototype.hasOwnProperty.call(body, 'executionPolicy') || body.executionPolicy !== null) {
+          return jsonResponse({
+            error: 'Clear the execution policy before closing the issue.'
+          }, 422);
+        }
+
         await originalUpdate(importedIssue.id, {
           status: 'done',
+          executionPolicy: null,
           executionState: null
         } as never, 'company-1');
       }
@@ -19145,12 +19402,18 @@ test('worker clears pending review and approval execution state before closing a
     assert.equal(statusPatchRequests.length, 1);
     assert.equal(statusPatchRequests[0]?.issueId, importedIssue.id);
     assert.equal(statusPatchRequests[0]?.body?.status, 'done');
+    assert.equal(Object.prototype.hasOwnProperty.call(statusPatchRequests[0]?.body ?? {}, 'executionPolicy'), true);
+    assert.equal(statusPatchRequests[0]?.body?.executionPolicy, null);
     assert.equal(Object.prototype.hasOwnProperty.call(statusPatchRequests[0]?.body ?? {}, 'executionState'), true);
     assert.equal(statusPatchRequests[0]?.body?.executionState, null);
+    assert.equal(Object.prototype.hasOwnProperty.call(statusPatchRequests[0]?.body ?? {}, 'assigneeAgentId'), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(statusPatchRequests[0]?.body ?? {}, 'assigneeUserId'), false);
     assert.equal(directStatusUpdateCalls.length, 0);
 
     const updatedIssue = await harness.ctx.issues.get(importedIssue.id, 'company-1') as Record<string, any> | null;
     assert.equal(updatedIssue?.status, 'done');
+    assert.equal(updatedIssue?.assigneeAgentId, 'agent-3');
+    assert.equal(updatedIssue?.executionPolicy ?? null, null);
     assert.equal(updatedIssue?.executionState ?? null, null);
   } finally {
     globalThis.fetch = originalFetch;
