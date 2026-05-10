@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer';
 import { realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -22,6 +23,7 @@ import {
   COMPANY_METRIC_API_ROUTE_KEY,
   GITHUB_SYNC_PLUGIN_ID,
   ISSUE_LINK_API_ROUTE_KEY,
+  PULL_REQUEST_ASSET_API_ROUTE_KEY,
 } from './kpi-contract.ts';
 import { normalizePaperclipHealthResponse, requiresPaperclipBoardAccess } from './paperclip-health.ts';
 
@@ -114,6 +116,40 @@ const AI_AUTHORED_MARKDOWN_FOOTER_PATTERN =
 const HIDDEN_GITHUB_IMPORT_MARKER_PREFIX = '<!-- paperclip-github-plugin-imported-from: ';
 const HIDDEN_GITHUB_IMPORT_MARKER_SUFFIX = ' -->';
 const EMPTY_GITHUB_ISSUE_DESCRIPTION_PLACEHOLDER = '_No description provided on GitHub._';
+const MAX_PULL_REQUEST_ASSET_BYTES = 10 * 1024 * 1024;
+const DEFAULT_PULL_REQUEST_ASSET_MIME_TYPE = 'application/octet-stream';
+const PULL_REQUEST_ASSET_MIME_TYPE_BY_EXTENSION: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp',
+  gif: 'image/gif',
+  pdf: 'application/pdf',
+  txt: 'text/plain',
+  md: 'text/markdown',
+  markdown: 'text/markdown',
+  json: 'application/json',
+  csv: 'text/csv',
+  xml: 'application/xml',
+  zip: 'application/zip',
+  gz: 'application/gzip',
+  tgz: 'application/gzip'
+};
+const PULL_REQUEST_ASSET_EXTENSION_BY_MIME_TYPE: Record<string, string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+  'application/pdf': 'pdf',
+  'text/plain': 'txt',
+  'text/markdown': 'md',
+  'application/json': 'json',
+  'text/csv': 'csv',
+  'application/xml': 'xml',
+  'application/zip': 'zip',
+  'application/gzip': 'gz',
+  'application/octet-stream': 'bin'
+};
 
 type PluginSetupContext = Parameters<Parameters<typeof definePlugin>[0]['setup']>[0];
 type PaperclipIssueStatus = Issue['status'];
@@ -14458,6 +14494,233 @@ function buildToolSuccessResult(content: string, data: unknown): ToolResult {
   };
 }
 
+function normalizePullRequestAssetMimeType(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*(?:;\s*[a-z0-9!#$&^_.+-]+=[a-z0-9!#$&^_.+-]+)*$/.test(normalized)) {
+    return undefined;
+  }
+
+  return normalized.split(';', 1)[0];
+}
+
+function getPullRequestAssetMimeTypeFromFileName(fileName: string): string | undefined {
+  const extensionMatch = fileName.trim().toLowerCase().match(/\.([a-z0-9]+)$/);
+  if (!extensionMatch) {
+    return undefined;
+  }
+
+  return PULL_REQUEST_ASSET_MIME_TYPE_BY_EXTENSION[extensionMatch[1]];
+}
+
+function getPullRequestAssetExtension(fileName: string): string | undefined {
+  const extensionMatch = fileName.trim().toLowerCase().match(/\.([a-z0-9]+)$/);
+  return extensionMatch?.[1];
+}
+
+function sanitizePullRequestAssetFileName(fileNameInput: unknown, mimeType: string): string {
+  const inferredExtension = PULL_REQUEST_ASSET_EXTENSION_BY_MIME_TYPE[mimeType] ?? 'bin';
+  const fallbackBaseName = `asset.${inferredExtension}`;
+  const rawFileName = normalizeOptionalString(fileNameInput) ?? fallbackBaseName;
+  const lastSegment = rawFileName.split(/[\\/]+/).filter(Boolean).at(-1) ?? fallbackBaseName;
+  const extension = getPullRequestAssetExtension(lastSegment) ?? inferredExtension;
+  const withoutExtension = lastSegment.replace(/\.[A-Za-z0-9]+$/, '');
+  const sanitizedBaseName = withoutExtension
+    .normalize('NFKD')
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/[-_.]+$/g, '')
+    .replace(/^[-_.]+/g, '')
+    .slice(0, 80)
+    || 'asset';
+
+  return `${sanitizedBaseName}.${extension}`;
+}
+
+function sanitizePullRequestAssetLabel(value: unknown, fallbackFileName: string): string {
+  const normalized = normalizeOptionalString(value);
+  return (normalized ?? fallbackFileName.replace(/[-_.]+/g, ' ')).slice(0, 200);
+}
+
+function sanitizePullRequestAssetArtifactBranch(value: unknown, pullRequestNumber: number): string {
+  const normalized = normalizeOptionalString(value);
+  const candidate = normalized ?? `paperclip-artifacts-pr-${pullRequestNumber}`;
+  const sanitized = candidate
+    .replace(/[^A-Za-z0-9._/-]+/g, '-')
+    .replace(/\.\.+/g, '.')
+    .replace(/\/{2,}/g, '/')
+    .replace(/^[-/.]+|[-/.]+$/g, '');
+  if (!sanitized || sanitized.includes('..') || sanitized.startsWith('/') || sanitized.endsWith('.lock')) {
+    throw new Error('artifactBranch must be a safe Git branch name.');
+  }
+
+  return sanitized;
+}
+
+function decodePullRequestAssetContent(payload: Record<string, unknown>): {
+  bytes: Buffer;
+  mimeType: string;
+} {
+  const dataUrl = normalizeOptionalString(payload.dataUrl);
+  let contentBase64 = normalizeOptionalString(payload.contentBase64);
+  let mimeType = normalizePullRequestAssetMimeType(payload.mimeType);
+
+  if (dataUrl) {
+    const match = dataUrl.match(/^data:([^;,]+(?:;[^,]+)?);base64,(.+)$/is);
+    if (!match) {
+      throw new Error('dataUrl must be a base64 data URL.');
+    }
+
+    const dataUrlMimeType = normalizePullRequestAssetMimeType(match[1]);
+    if (!dataUrlMimeType) {
+      throw new Error('dataUrl MIME type must be a valid MIME type such as image/png or application/pdf.');
+    }
+
+    mimeType = dataUrlMimeType;
+    contentBase64 = match[2].replace(/\s+/g, '');
+  }
+
+  if (!contentBase64) {
+    throw new Error('contentBase64 or dataUrl is required.');
+  }
+
+  mimeType = mimeType ?? getPullRequestAssetMimeTypeFromFileName(normalizeOptionalString(payload.fileName) ?? '') ?? DEFAULT_PULL_REQUEST_ASSET_MIME_TYPE;
+
+  const normalizedBase64 = contentBase64.replace(/\s+/g, '');
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(normalizedBase64) || normalizedBase64.length % 4 === 1) {
+    throw new Error('Asset content must be valid base64.');
+  }
+
+  const bytes = Buffer.from(normalizedBase64, 'base64');
+  if (bytes.length === 0) {
+    throw new Error('Asset content must not be empty.');
+  }
+  if (bytes.length > MAX_PULL_REQUEST_ASSET_BYTES) {
+    throw new Error(`Asset content exceeds the ${MAX_PULL_REQUEST_ASSET_BYTES} byte limit.`);
+  }
+
+  return {
+    bytes,
+    mimeType
+  };
+}
+
+function buildPullRequestAssetMarkdown(label: string, rawUrl: string, mimeType: string): string {
+  const normalizedLabel = label.replace(/[\]\n\r]/g, ' ').trim();
+  if (mimeType.startsWith('image/')) {
+    return `![${normalizedLabel}](${rawUrl})`;
+  }
+
+  return `[${normalizedLabel}](${rawUrl})`;
+}
+
+async function uploadPullRequestAssetArtifact(params: {
+  octokit: Octokit;
+  repository: ParsedRepositoryReference;
+  pullRequestNumber: number;
+  payload: Record<string, unknown>;
+}): Promise<Record<string, unknown>> {
+  const { bytes, mimeType } = decodePullRequestAssetContent(params.payload);
+  const fileName = sanitizePullRequestAssetFileName(params.payload.fileName, mimeType);
+  const label = sanitizePullRequestAssetLabel(params.payload.label ?? params.payload.alt, fileName);
+  const caption = normalizeOptionalString(params.payload.caption);
+  const artifactBranch = sanitizePullRequestAssetArtifactBranch(params.payload.artifactBranch, params.pullRequestNumber);
+  const pullRequestResponse = await params.octokit.rest.pulls.get({
+    owner: params.repository.owner,
+    repo: params.repository.repo,
+    pull_number: params.pullRequestNumber,
+    headers: {
+      'X-GitHub-Api-Version': GITHUB_API_VERSION
+    }
+  });
+  const headSha = pullRequestResponse.data.head.sha;
+  const shortHeadSha = headSha.slice(0, 12);
+  const contentPath = `assets/pr-${params.pullRequestNumber}/${shortHeadSha}/${fileName}`;
+
+  let branchSha: string | undefined;
+  try {
+    const branchRefResponse = await params.octokit.rest.git.getRef({
+      owner: params.repository.owner,
+      repo: params.repository.repo,
+      ref: `heads/${artifactBranch}`,
+      headers: {
+        'X-GitHub-Api-Version': GITHUB_API_VERSION
+      }
+    });
+    branchSha = branchRefResponse.data.object.sha;
+  } catch (error) {
+    if (getErrorStatus(error) !== 404) {
+      throw error;
+    }
+  }
+
+  if (!branchSha) {
+    await params.octokit.rest.git.createRef({
+      owner: params.repository.owner,
+      repo: params.repository.repo,
+      ref: `refs/heads/${artifactBranch}`,
+      sha: pullRequestResponse.data.base.sha,
+      headers: {
+        'X-GitHub-Api-Version': GITHUB_API_VERSION
+      }
+    });
+  }
+
+  let existingFileSha: string | undefined;
+  try {
+    const existingContentResponse = await params.octokit.rest.repos.getContent({
+      owner: params.repository.owner,
+      repo: params.repository.repo,
+      path: contentPath,
+      ref: artifactBranch,
+      headers: {
+        'X-GitHub-Api-Version': GITHUB_API_VERSION
+      }
+    });
+    if (!Array.isArray(existingContentResponse.data) && existingContentResponse.data.type === 'file') {
+      existingFileSha = existingContentResponse.data.sha;
+    }
+  } catch (error) {
+    if (getErrorStatus(error) !== 404) {
+      throw error;
+    }
+  }
+
+  const updateResponse = await params.octokit.rest.repos.createOrUpdateFileContents({
+    owner: params.repository.owner,
+    repo: params.repository.repo,
+    path: contentPath,
+    message: `Add asset for PR #${params.pullRequestNumber}`,
+    content: bytes.toString('base64'),
+    branch: artifactBranch,
+    ...(existingFileSha ? { sha: existingFileSha } : {}),
+    headers: {
+      'X-GitHub-Api-Version': GITHUB_API_VERSION
+    }
+  });
+  const commitSha = updateResponse.data.commit.sha;
+  const rawUrl = `https://raw.githubusercontent.com/${params.repository.owner}/${params.repository.repo}/${commitSha}/${contentPath}`;
+  const markdown = buildPullRequestAssetMarkdown(label, rawUrl, mimeType);
+
+  return {
+    repository: params.repository.url,
+    pullRequestNumber: params.pullRequestNumber,
+    artifactBranch,
+    path: contentPath,
+    fileName,
+    mimeType,
+    sizeBytes: bytes.length,
+    commitSha,
+    rawUrl,
+    markdown,
+    label,
+    ...(mimeType.startsWith('image/') ? { alt: label } : {}),
+    ...(caption ? { caption } : {})
+  };
+}
+
 function buildToolErrorResult(error: unknown): ToolResult {
   const rateLimitPause = getGitHubRateLimitPauseDetails(error);
   if (rateLimitPause) {
@@ -14685,12 +14948,16 @@ async function handleCompanyMetricApiRoute(
   };
 }
 
-function parseIssueLinkApiRouteBody(input: PluginApiRequestInput): Record<string, unknown> {
+function parsePluginApiRouteJsonObjectBody(input: PluginApiRequestInput, routeLabel: string): Record<string, unknown> {
   if (!input.body || typeof input.body !== 'object' || Array.isArray(input.body)) {
-    throw new Error('Issue link route body must be a JSON object.');
+    throw new Error(`${routeLabel} body must be a JSON object.`);
   }
 
   return input.body as Record<string, unknown>;
+}
+
+function parseIssueLinkApiRouteBody(input: PluginApiRequestInput): Record<string, unknown> {
+  return parsePluginApiRouteJsonObjectBody(input, 'Issue link route');
 }
 
 function normalizeIssueLinkApiRouteKind(payload: Record<string, unknown>): 'issue' | 'pull_request' | null {
@@ -14716,6 +14983,55 @@ function normalizeIssueLinkApiRouteKind(payload: Record<string, unknown>): 'issu
   }
 
   return null;
+}
+
+async function handlePullRequestAssetApiRoute(
+  ctx: PluginSetupContext,
+  input: PluginApiRequestInput
+): Promise<PluginApiResponse> {
+  if (input.actor.actorType !== 'agent') {
+    throw new Error('Pull request assets must be uploaded by an authenticated Paperclip agent.');
+  }
+
+  const payload = parsePluginApiRouteJsonObjectBody(input, 'Pull request asset route');
+  const rawPullRequestUrl = normalizeOptionalString(payload.pullRequestUrl);
+  const pullRequestUrl = normalizeGitHubPullRequestHtmlUrl(rawPullRequestUrl);
+  if (rawPullRequestUrl && !pullRequestUrl) {
+    throw new Error('pullRequestUrl must be a valid GitHub pull request URL.');
+  }
+  const parsedPullRequestUrl = pullRequestUrl ? parseGitHubPullRequestHtmlUrl(pullRequestUrl) : undefined;
+  const repositoryInput = normalizeOptionalString(payload.repository) ?? parsedPullRequestUrl?.repositoryUrl;
+  if (!repositoryInput) {
+    throw new Error('repository is required unless pullRequestUrl is provided.');
+  }
+
+  const repository = requireRepositoryReference(repositoryInput);
+  const pullRequestNumber = normalizeToolPositiveInteger(payload.pullRequestNumber) ?? parsedPullRequestUrl?.pullRequestNumber;
+  if (!pullRequestNumber) {
+    throw new Error('pullRequestNumber is required unless pullRequestUrl is provided.');
+  }
+  if (parsedPullRequestUrl && !areRepositoriesEqual(repository, requireRepositoryReference(parsedPullRequestUrl.repositoryUrl))) {
+    throw new Error('repository must match pullRequestUrl.');
+  }
+
+  const octokit = await createGitHubToolOctokit(ctx, input.companyId, {
+    toolName: PULL_REQUEST_ASSET_API_ROUTE_KEY,
+    repositoryUrl: repository.url
+  });
+  const asset = await uploadPullRequestAssetArtifact({
+    octokit,
+    repository,
+    pullRequestNumber,
+    payload
+  });
+
+  return {
+    status: 201,
+    body: {
+      status: 'uploaded',
+      asset
+    }
+  };
 }
 
 async function handleIssueLinkApiRoute(
@@ -21002,6 +21318,29 @@ function registerGitHubAgentTools(ctx: PluginSetupContext): void {
   );
 
   ctx.tools.register(
+    'upload_pull_request_asset',
+    getGitHubAgentToolDeclaration('upload_pull_request_asset'),
+    async (params, runCtx) => executeGitHubTool(async () => {
+      const input = getToolInputRecord(params);
+      const target = await resolveGitHubPullRequestToolTarget(ctx, runCtx, input);
+      const octokit = await createAgentToolOctokit(runCtx, 'upload_pull_request_asset', target.repository);
+      const asset = await uploadPullRequestAssetArtifact({
+        octokit,
+        repository: target.repository,
+        pullRequestNumber: target.pullRequestNumber,
+        payload: input
+      });
+
+      return buildToolSuccessResult(
+        `Uploaded asset ${asset.fileName} for pull request #${target.pullRequestNumber}.`,
+        {
+          asset
+        }
+      );
+    })
+  );
+
+  ctx.tools.register(
     'link_github_item',
     getGitHubAgentToolDeclaration('link_github_item'),
     async (params, runCtx) => executeGitHubTool(async () => {
@@ -21616,6 +21955,10 @@ const plugin = definePlugin({
 
     if (input.routeKey === ISSUE_LINK_API_ROUTE_KEY) {
       return handleIssueLinkApiRoute(pluginRuntimeContext, input);
+    }
+
+    if (input.routeKey === PULL_REQUEST_ASSET_API_ROUTE_KEY) {
+      return handlePullRequestAssetApiRoute(pluginRuntimeContext, input);
     }
 
     return {

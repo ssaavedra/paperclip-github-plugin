@@ -533,6 +533,58 @@ export const GITHUB_AGENT_TOOLS: PluginToolDeclaration[] = [
     }
   },
   {
+    name: 'upload_pull_request_asset',
+    displayName: 'Upload Pull Request Asset',
+    description: 'Upload a PR-visible asset such as an image, PDF, log, archive, or report to a non-merge artifact branch and return durable markdown that can be embedded in the PR body.',
+    parametersSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['fileName'],
+      allOf: [pullRequestTargetSchema],
+      anyOf: [
+        { required: ['contentBase64'] },
+        { required: ['dataUrl'] }
+      ],
+      properties: {
+        repository: repositoryProperty,
+        pullRequestNumber: pullRequestNumberProperty,
+        paperclipIssueId: paperclipIssueIdProperty,
+        fileName: {
+          type: 'string',
+          description: 'Asset filename. The plugin sanitizes it and preserves a safe extension.'
+        },
+        label: {
+          type: 'string',
+          description: 'Human-readable link text for the returned Markdown. Defaults to the sanitized filename.'
+        },
+        alt: {
+          type: 'string',
+          description: 'Backward-compatible alias for label, useful as image alt text.'
+        },
+        caption: {
+          type: 'string',
+          description: 'Optional human-facing caption returned with the uploaded asset metadata.'
+        },
+        contentBase64: {
+          type: 'string',
+          description: 'Base64-encoded asset bytes. Assets are limited to 10 MiB.'
+        },
+        dataUrl: {
+          type: 'string',
+          description: 'Alternative base64 data URL input such as data:application/pdf;base64,... or data:image/png;base64,... .'
+        },
+        mimeType: {
+          type: 'string',
+          description: 'Optional MIME type such as application/pdf or image/png. If omitted, the plugin infers common types from fileName and otherwise uses application/octet-stream.'
+        },
+        artifactBranch: {
+          type: 'string',
+          description: 'Optional artifact branch name. Defaults to paperclip-artifacts-pr-<pullRequestNumber>.'
+        }
+      }
+    }
+  },
+  {
     name: 'link_github_item',
     displayName: 'Link GitHub Item',
     description: 'Link a Paperclip issue to a GitHub issue or pull request so GitHub Sync can monitor status even when the repository is not mapped to a Paperclip project.',
